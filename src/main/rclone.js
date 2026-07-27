@@ -159,8 +159,24 @@ async function addRemote(name, provider, params = {}) {
 }
 
 async function removeRemote(name) {
-  const { code, stderr } = await run(['config', 'delete', name]);
-  if (code !== 0) throw new Error(`Failed to remove remote "${name}": ${stderr}`);
+  // rclone's `config delete` operates on the config section name, which
+  // never includes a trailing colon (that's only used when referring to
+  // remote:path in file operations) — strip one defensively in case a
+  // caller passes one, since rclone doesn't error on a colon-suffixed name
+  // that matches no section: it just exits 0 having deleted nothing,
+  // which silently looks like the remote was removed when it wasn't.
+  const safeName = name.replace(/:$/, '');
+  const { code, stderr } = await run(['config', 'delete', safeName]);
+  if (code !== 0) throw new Error(`Failed to remove remote "${safeName}": ${stderr}`);
+
+  // Belt-and-suspenders: `config delete` exiting 0 doesn't actually
+  // guarantee the remote is gone (see above), so confirm it before
+  // reporting success — otherwise a future edge case here would
+  // reproduce the exact "Remove does nothing" bug silently again.
+  const remaining = await listRemotes();
+  if (remaining.includes(`${safeName}:`)) {
+    throw new Error(`rclone reported success removing "${safeName}", but it's still configured.`);
+  }
 }
 
 module.exports = {

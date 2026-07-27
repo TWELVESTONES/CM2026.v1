@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CloudMerge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>CloudMerge</h1>
+    <p class="subtitle">All your cloud drives, one folder.</p>
+  </header>
+
+  <section id="status-banner" class="banner"></section>
+
+  <section id="account-list-section">
+    <h2>Connected accounts</h2>
+    <ul id="account-list"></ul>
+    <p id="empty-state" class="empty-state">No accounts yet — add one below.</p>
+  </section>
+
+  <section id="add-account-section">
+    <h2>Add an account</h2>
+    <div class="provider-row">
+      <button class="provider-btn" data-provider="google_drive">+ Google Drive</button>
+      <button class="provider-btn" data-provider="onedrive">+ OneDrive</button>
+      <button class="provider-btn" data-provider="dropbox">+ Dropbox</button>
+      <button class="provider-btn" data-provider="wd_cloud">+ WD Cloud / NAS</button>
+    </div>
+    <p class="hint">
+      Google Drive / OneDrive / Dropbox open a browser sign-in window — finish
+      there, then come back. WD My Cloud (and other NAS devices) connect over
+      your local network instead, so that one asks for the device's address
+      and login directly.
+    </p>
+
+    <form id="smb-form" class="smb-form" hidden>
+      <h3 id="smb-form-title">Connect a network drive</h3>
+      <label>Device address
+        <input type="text" name="host" placeholder="192.168.1.50 or mycloudname.local" required />
+      </label>
+      <label>Share name
+        <input type="text" name="share" placeholder="Public" required />
+      </label>
+      <label>Username
+        <input type="text" name="user" required />
+      </label>
+      <label>Password
+        <input type="password" name="pass" />
+      </label>
+      <div class="smb-form-actions">
+        <button type="submit" id="smb-connect-btn">Connect</button>
+        <button type="button" id="smb-cancel-btn">Cancel</button>
+      </div>
+      <p class="hint">
+        Password is optional only if this share allows guest access. Your
+        WD device's address and share name are visible in WD Discovery or
+        your router's device list.
+      </p>
+    </form>
+  </section>
+
+  <footer>
+    <button id="open-folder-btn">Open Cloud Folder</button>
+    <button id="about-btn" class="link-btn">About &amp; open-source notices</button>
+  </footer>
+
+  <dialog id="about-dialog">
+    <h2>CloudMerge</h2>
+    <p>CloudMerge is free and open source, licensed under the MIT License.</p>
+    <p>It's built on top of, and gratefully depends on:</p>
+    <ul class="notice-list">
+      <li>
+        <strong>rclone</strong> — Copyright &copy; 2012 Nick Craig-Wood, MIT
+        License. <a href="https://rclone.org" target="_blank" rel="noopener">rclone.org</a>
+      </li>
+      <li>
+        <strong>WinFsp - Windows File System Proxy, Copyright (C) Bill
+        Zissimopoulos.</strong>
+        <a href="https://github.com/winfsp/winfsp" target="_blank" rel="noopener">github.com/winfsp/winfsp</a>
+      </li>
+      <li>
+        <strong>macFUSE</strong> — Copyright &copy; Benjamin Fleischer.
+        <a href="https://osxfuse.github.io/" target="_blank" rel="noopener">osxfuse.github.io</a>
+      </li>
+    </ul>
+    <p class="hint">Full license texts: see NOTICE.md and resources/licenses/ in the CloudMerge source.</p>
+    <button id="close-about-btn">Close</button>
+  </dialog>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

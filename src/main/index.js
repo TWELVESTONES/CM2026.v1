@@ -6,6 +6,8 @@ const AutoLaunch = require('auto-launch');
 const rclone = require('./rclone');
 const mountMgr = require('./mount');
 const driverCheck = require('./driver-check');
+const accountLabels = require('./account-labels');
+const accountIdentity = require('./account-identity');
 
 // Last-resort safety net: an uncaught error anywhere in the main process
 // used to mean the app just quietly stopped doing anything further, with
@@ -108,6 +110,13 @@ app.on('ready', async () => {
       if (await driverCheck.ensureDriverOrPrompt()) {
         try { await mountMgr.mount(); } catch (e) { /* surfaced in UI on open */ }
       }
+      // Fire-and-forget: fill in friendly labels (e.g. an email address)
+      // for any account connected before this lookup existed, or whose
+      // lookup didn't succeed the first time. Never awaited — must not
+      // delay startup — and the renderer's periodic refresh will just
+      // pick up the result whenever it lands.
+      accountIdentity.backfillLabels(rclone, accountLabels, remotes.map((r) => r.replace(/:$/, '')))
+        .catch(() => {});
     } else {
       createWindow();
     }
@@ -139,15 +148,25 @@ ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
   if (!mountMgr.isMounted() && (await driverCheck.ensureDriverOrPrompt())) {
     await mountMgr.mount();
   }
+  // Best-effort only: label lookup failing (offline, revoked scope, API
+  // change) should never block the account from being added — the UI just
+  // falls back to showing the technical remote name in that case.
+  try {
+    const identity = await accountIdentity.lookupIdentity(rclone, safeName, provider);
+    if (identity) accountLabels.setLabel(safeName, identity);
+  } catch (_) { /* cosmetic only */ }
   refreshTray();
   return safeName;
 });
 
 ipcMain.handle('accounts:remove', async (_evt, name) => {
   await rclone.removeRemote(name);
+  accountLabels.removeLabel(name.replace(/:$/, ''));
   await mountMgr.regenerateCombineRemote();
   refreshTray();
 });
+
+ipcMain.handle('accounts:labels', async () => accountLabels.readAll());
 
 ipcMain.handle('mount:open', async () => {
   const result = await shell.openPath(mountMgr.MOUNT_DIR);

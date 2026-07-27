@@ -4,12 +4,19 @@
  * driver-check.js — verify the platform's FUSE-compatible driver is present
  * before attempting a mount.
  *
- * CloudMerge does NOT bundle the WinFsp or macFUSE installers. Both
- * projects require a paid commercial license to bundle/distribute with
- * closed-source software (see LICENSING.md) — that's a business step for
- * you to complete directly with each project's author, not something this
- * code can do for you. Until that's sorted, CloudMerge points users at the
- * official installers instead of shipping them itself.
+ * As of v0.1.3, the Windows installer bundles the official, unmodified
+ * WinFsp installer and silently runs it during setup if WinFsp isn't
+ * already present — permitted under WinFsp's own FLOSS exception, since
+ * CloudMerge is MIT-licensed and carries the required attribution in its
+ * About screen (see NOTICE.md for the full reasoning). So on a normal
+ * v0.1.3+ Windows install, this check should always already pass.
+ *
+ * It still exists as a safety net for cases where that silent install
+ * didn't happen or didn't succeed (e.g. upgraded in-place from an older
+ * version, the bundled installer was blocked by policy/antivirus, or
+ * you're on macOS, where macFUSE's stricter license means CloudMerge
+ * still can't bundle it and has to point at the official installer
+ * instead — see NOTICE.md).
  */
 
 const fs = require('fs');
@@ -38,13 +45,20 @@ async function ensureDriverOrPrompt() {
   const name = isWin ? 'WinFsp' : 'macFUSE';
   const url = isWin ? 'https://winfsp.dev/rel/' : 'https://macfuse.github.io/';
 
+  const detail = isWin
+    ? `CloudMerge's installer normally installs WinFsp for you automatically, so seeing ` +
+      `this dialog usually means that step didn't complete (a policy/antivirus block, or ` +
+      `an in-place upgrade from an older CloudMerge version that didn't bundle it). Click ` +
+      `"Open download page" to install it manually, then relaunch CloudMerge.`
+    : `macFUSE isn't bundled with CloudMerge — its license terms are stricter than WinFsp's ` +
+      `and require separate written permission from its author before bundling (see ` +
+      `NOTICE.md). Click "Open download page" to install it, then relaunch CloudMerge.`;
+
   const { response } = await dialog.showMessageBox({
     type: 'warning',
     title: `${name} required`,
     message: `CloudMerge needs ${name} installed to mount your cloud accounts as a folder.`,
-    detail: `${name} isn't bundled with CloudMerge (its license requires a separate ` +
-      `commercial agreement for closed-source distribution — see LICENSING.md). ` +
-      `Click "Open download page" to install it, then relaunch CloudMerge.`,
+    detail,
     buttons: ['Open download page', 'Cancel'],
     defaultId: 0,
   });

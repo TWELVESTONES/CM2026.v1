@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+
+# Fetched by scripts/fetch-rclone.sh — not committed (large binaries, and
+# redistribution of rclone itself should always come from the official
+# source at build time, not a stale copy in git history).
+resources/bin/win/
+resources/bin/mac/
+resources/bin/rclone-linux

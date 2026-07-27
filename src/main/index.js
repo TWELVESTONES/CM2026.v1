@@ -49,7 +49,7 @@ function refreshTray() {
 }
 
 app.on('ready', async () => {
-  tray = new Tray(path.join(__dirname, '..', '..', 'build', 'tray-icon.png'));
+  tray = new Tray(path.join(__dirname, 'assets', 'tray-icon.png'));
   tray.setToolTip('CloudMerge — all your cloud drives, one folder');
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', createWindow);

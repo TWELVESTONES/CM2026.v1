@@ -8,3 +8,6 @@ dist/
 resources/bin/win/
 resources/bin/mac/
 resources/bin/rclone-linux
+
+# Fetched by scripts/fetch-winfsp.sh — same reasoning as above.
+resources/winfsp/

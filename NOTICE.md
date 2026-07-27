@@ -26,6 +26,16 @@ the in-app "About" screen and this file). Full license text bundled at
 fork this into a closed-source product) is available directly from Bill
 Zissimopoulos — see that file for contact details.
 
+As of v0.1.3, the Windows installer also bundles the official, unmodified
+WinFsp installer (`winfsp-2.1.25156.msi`, downloaded as-is from WinFsp's own
+GitHub releases) and silently runs it during setup if WinFsp isn't already
+present on the machine. This is covered by the same FLOSS exception quoted
+above — specifically its second grant, "permission to distribute unmodified
+binary releases of the WinFsp installer (as released by the WinFsp
+project)." If you fork this project, keep the bundled `.msi` unmodified and
+keep this notice + the About screen attribution intact, or drop the
+bundling and fall back to the download-page prompt in `driver-check.js`.
+
 ## macFUSE (Mac mounting)
 
 **macFUSE, Copyright (C) 2011-2026 Benjamin Fleischer** (and prior

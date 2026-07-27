@@ -56,6 +56,7 @@ NOTICE.md                  Required third-party attributions (rclone, WinFsp, ma
 
 ```
 scripts/fetch-rclone.sh      # or fetch-rclone.ps1 on Windows — downloads the real rclone binaries
+scripts/fetch-winfsp.sh      # downloads the official WinFsp installer, bundled into the Windows build
 npm install
 npm run start                # run unpacked, for development
 npm run dist:win              # → dist/CloudMerge Setup <version>.exe  (built & tested — works from Linux via wine)

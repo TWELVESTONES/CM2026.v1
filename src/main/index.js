@@ -7,13 +7,45 @@ const rclone = require('./rclone');
 const mountMgr = require('./mount');
 const driverCheck = require('./driver-check');
 
+// Last-resort safety net: an uncaught error anywhere in the main process
+// used to mean the app just quietly stopped doing anything further, with
+// no window, no tray, and no way for the user to know something went
+// wrong. Surface it instead — a visible error beats an invisible zombie
+// process every time.
+process.on('uncaughtException', (err) => {
+  try {
+    dialog.showErrorBox('CloudMerge hit an unexpected error', String(err && err.stack || err));
+  } catch (_) { /* dialog module itself unavailable this early — nothing more we can do */ }
+});
+process.on('unhandledRejection', (err) => {
+  try {
+    dialog.showErrorBox('CloudMerge hit an unexpected error', String(err && err.stack || err));
+  } catch (_) { /* same as above */ }
+});
+
 let tray = null;
 let win = null;
 
 const autoLauncher = new AutoLaunch({ name: 'CloudMerge' });
 
+// Only one CloudMerge instance should ever run at a time — without this,
+// double-clicking the desktop icon (or auto-launch plus a manual launch)
+// silently spawns a second, third, fourth... background process, each
+// invisible unless its own window happens to still be open. If the lock
+// fails, this process IS the extra copy — bow out immediately and let the
+// original instance (which will be focused via 'second-instance' below)
+// keep handling things.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    createWindow();
+  });
+}
+
 function createWindow() {
-  if (win) { win.show(); return; }
+  if (win) { win.show(); win.focus(); return; }
   win = new BrowserWindow({
     width: 480,
     height: 620,
@@ -49,22 +81,44 @@ function refreshTray() {
 }
 
 app.on('ready', async () => {
-  tray = new Tray(path.join(__dirname, 'assets', 'tray-icon.png'));
-  tray.setToolTip('CloudMerge — all your cloud drives, one folder');
-  tray.setContextMenu(buildTrayMenu());
-  tray.on('click', createWindow);
+  try {
+    tray = new Tray(path.join(__dirname, 'assets', 'tray-icon.png'));
+    tray.setToolTip('CloudMerge — all your cloud drives, one folder');
+    tray.setContextMenu(buildTrayMenu());
+    tray.on('click', createWindow);
+  } catch (e) {
+    // Tray creation failing would previously take the whole startup down
+    // with it silently. Surface something rather than nothing.
+    dialog.showErrorBox('CloudMerge failed to start the tray icon', String(e && e.message || e));
+  }
 
   try {
     if (!(await autoLauncher.isEnabled())) await autoLauncher.enable();
   } catch (e) { /* non-fatal: auto-launch is a nicety, not a requirement */ }
 
-  const remotes = await rclone.listRemotes();
-  if (remotes.length > 0) {
-    if (await driverCheck.ensureDriverOrPrompt()) {
-      try { await mountMgr.mount(); } catch (e) { /* surfaced in UI on open */ }
+  // Everything below talks to the bundled rclone binary. If that spawn
+  // fails for any reason (blocked by antivirus, missing dependency, first
+  // run before WinFsp exists, etc.), it used to throw here uncaught —
+  // which silently skipped createWindow() below, leaving the process
+  // running invisibly with no window and nothing for the user to see or
+  // act on. Always fall through to a visible window instead.
+  try {
+    const remotes = await rclone.listRemotes();
+    if (remotes.length > 0) {
+      if (await driverCheck.ensureDriverOrPrompt()) {
+        try { await mountMgr.mount(); } catch (e) { /* surfaced in UI on open */ }
+      }
+    } else {
+      createWindow();
     }
-  } else {
+  } catch (e) {
     createWindow();
+    dialog.showErrorBox(
+      'CloudMerge had trouble talking to rclone',
+      `${e && e.message || e}\n\nThis usually means antivirus software is blocking ` +
+      `resources/bin/rclone.exe, or it failed to run for another reason. You can still ` +
+      `use this window; account connections may not work until that's resolved.`
+    );
   }
   refreshTray();
 });

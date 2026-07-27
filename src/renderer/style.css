@@ -18,6 +18,8 @@ body {
 }
 
 header { padding: 20px 20px 8px; }
+header.app-header { display: flex; align-items: center; gap: 12px; }
+.app-logo { border-radius: 9px; flex-shrink: 0; }
 header h1 { margin: 0; font-size: 20px; }
 .subtitle { margin: 4px 0 0; color: var(--muted); }
 

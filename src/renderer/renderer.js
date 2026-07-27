@@ -20,7 +20,11 @@ function providerLabel(remoteName) {
 }
 
 async function refreshAccountList() {
-  const remotes = (await window.cloudmerge.listAccounts())
+  const [remotesRaw, labels] = await Promise.all([
+    window.cloudmerge.listAccounts(),
+    window.cloudmerge.listAccountLabels(),
+  ]);
+  const remotes = remotesRaw
     .map((r) => r.replace(/:$/, ''))
     .filter((r) => r !== 'merged');
 
@@ -30,7 +34,10 @@ async function refreshAccountList() {
   for (const name of remotes) {
     const li = document.createElement('li');
     const label = document.createElement('span');
-    label.textContent = `${providerLabel(name)} — ${name}`;
+    // Prefer the looked-up account identity (e.g. an email address) when
+    // we have one; fall back to the internal rclone remote name otherwise
+    // — that lookup is best-effort and may not always succeed.
+    label.textContent = `${providerLabel(name)} — ${labels[name] || name}`;
     const removeBtn = document.createElement('button');
     removeBtn.className = 'remove-btn';
     removeBtn.textContent = 'Remove';

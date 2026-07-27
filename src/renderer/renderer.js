@@ -43,7 +43,13 @@ async function refreshAccountList() {
     removeBtn.textContent = 'Remove';
     removeBtn.onclick = async () => {
       removeBtn.disabled = true;
-      await window.cloudmerge.removeAccount(name + ':');
+      // `name` here is already the bare remote name (colon stripped above
+      // for display) — pass it through as-is. rclone's `config delete`
+      // operates on the config section name, which never has a trailing
+      // colon; passing one silently no-ops (exit code 0, remote untouched)
+      // instead of erroring, which is what made this look like Remove
+      // just didn't do anything.
+      await window.cloudmerge.removeAccount(name);
       await refreshAccountList();
     };
     li.appendChild(label);

@@ -1,7 +1,7 @@
 {
   "name": "cloudmerge",
   "productName": "CloudMerge",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Free, open-source app that unifies Google Drive, OneDrive, Dropbox (and more) into one local folder on your own machine, powered by rclone. Nothing routes through a third-party server.",
   "main": "src/main/index.js",
   "author": "James Woodley",

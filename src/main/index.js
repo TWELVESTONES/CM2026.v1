@@ -108,7 +108,21 @@ app.on('ready', async () => {
     const remotes = await rclone.listRemotes();
     if (remotes.length > 0) {
       if (await driverCheck.ensureDriverOrPrompt()) {
-        try { await mountMgr.mount(); } catch (e) { /* surfaced in UI on open */ }
+        try {
+          await mountMgr.mount();
+        } catch (e) {
+          // This used to be swallowed with a comment claiming the error was
+          // "surfaced in UI on open" — nothing actually did that, so a mount
+          // failure here (e.g. the Windows directory-mount bug fixed in this
+          // release) was completely invisible: accounts looked "connected"
+          // in the list, but the folder just stayed empty forever with no
+          // explanation.
+          dialog.showErrorBox(
+            'CloudMerge could not connect your cloud folder',
+            `${e && e.message || e}\n\nYour accounts are still connected — try Manage Accounts, ` +
+            `or restart CloudMerge, to retry connecting the folder.`
+          );
+        }
       }
       // Fire-and-forget: fill in friendly labels (e.g. an email address)
       // for any account connected before this lookup existed, or whose
@@ -145,8 +159,28 @@ ipcMain.handle('providers:list', async () => rclone.PROVIDER_MAP);
 ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
   const safeName = await rclone.addRemote(name, provider, params);
   await mountMgr.regenerateCombineRemote();
-  if (!mountMgr.isMounted() && (await driverCheck.ensureDriverOrPrompt())) {
-    await mountMgr.mount();
+  // Always remount (not just "mount if not already mounted"): rclone's
+  // `combine` backend only reads its upstream list once, at mount start, so
+  // a live mount doesn't pick up a newly-added account on its own — it has
+  // to be torn down and re-established. This is also why previously only
+  // the *first* connected account ever actually showed up in the folder.
+  //
+  // Wrapped in try/catch (previously unguarded): a mount hiccup here is a
+  // separate, non-fatal problem from "was the account added" — the account
+  // above was already added successfully. Letting a mount failure throw out
+  // of this whole handler used to skip the friendly-name lookup below
+  // entirely and made the renderer wrongly report "Could not add account"
+  // for an account that, in fact, had been added.
+  try {
+    if (await driverCheck.ensureDriverOrPrompt()) {
+      await mountMgr.remount();
+    }
+  } catch (e) {
+    dialog.showErrorBox(
+      'CloudMerge added the account but could not refresh the connected folder',
+      `${e && e.message || e}\n\nThe account was added successfully — try Manage Accounts, ` +
+      `or restart CloudMerge, to retry connecting the folder.`
+    );
   }
   // Best-effort only: label lookup failing (offline, revoked scope, API
   // change) should never block the account from being added — the UI just
@@ -163,6 +197,18 @@ ipcMain.handle('accounts:remove', async (_evt, name) => {
   await rclone.removeRemote(name);
   accountLabels.removeLabel(name.replace(/:$/, ''));
   await mountMgr.regenerateCombineRemote();
+  // Same reasoning as accounts:add above: refresh the live mount so a
+  // removed account's folder actually disappears, and don't let a mount
+  // hiccup mask the fact that the account itself was removed successfully.
+  try {
+    if (mountMgr.isMounted()) await mountMgr.remount();
+  } catch (e) {
+    dialog.showErrorBox(
+      'CloudMerge removed the account but could not refresh the connected folder',
+      `${e && e.message || e}\n\nThe account was removed successfully — try restarting ` +
+      `CloudMerge to retry connecting the folder.`
+    );
+  }
   refreshTray();
 });
 

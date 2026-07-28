@@ -55,6 +55,7 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
+      "runAfterFinish": true,
       "include": "installer.nsh"
     },
     "mac": {

@@ -61,8 +61,19 @@ function providerLabel(remoteName) {
 // address, which never contains them, but sanitize defensively rather than
 // let an unexpected provider response (or display name) break mounting
 // entirely — falling back to the raw remote name if nothing usable remains.
+//
+// `=` is included here too, even though it's a perfectly legal filename
+// character on every OS CloudMerge supports: a QA pass ahead of this
+// release found that rclone's `combine` backend parses each upstream on the
+// *first* `=` it finds, splitting "dir=name:" into its two halves — so a
+// display name containing its own `=` (a work/school account's display name
+// is tenant-controlled free text, not something CloudMerge or the person
+// using it has any control over) would silently produce a malformed
+// upstream and take down the *entire* merged mount, exactly the class of
+// single-account-poisons-everything failure this whole release exists to
+// prevent. Every other character combine's parser accepts as-is.
 function sanitizeDirName(name, fallback) {
-  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').trim();
+  const cleaned = name.replace(/[<>:"/\\|?*=\x00-\x1f]/g, '_').replace(/[. ]+$/, '').trim();
   return cleaned || fallback;
 }
 
@@ -256,8 +267,22 @@ async function mount() {
   // default "fixed disk drive" mode) is what supports a folder target, so
   // we just don't pass the flag at all.
 
-  mountProcess = spawn(bin, args, { windowsHide: true });
-  mountProcess.on('exit', () => { mountProcess = null; });
+  // Capture this specific process in a local `proc` and only null out the
+  // module-level `mountProcess` if it's still the SAME process by the time
+  // 'exit' actually fires — not just whichever one happens to be current at
+  // that moment. Without this guard, a QA pass ahead of this release found
+  // a real race: unmount()'s 5s safety net (below) can resolve — and the
+  // caller (remount()) can go on to spawn a brand new mount process — before
+  // this OLD process's own 'exit' event has actually fired. When it finally
+  // does fire, its handler would blindly null out `mountProcess`, wiping out
+  // the reference to the live NEW process even though the new mount is
+  // still running fine — silently breaking isMounted() (so the tray/UI
+  // reports "not connected" for a folder that's actually working) and
+  // letting a later mount() spawn yet another duplicate process on top of
+  // it, since isMounted() would wrongly say nothing was running.
+  const proc = spawn(bin, args, { windowsHide: true });
+  proc.on('exit', () => { if (mountProcess === proc) mountProcess = null; });
+  mountProcess = proc;
 
   let stderrBuf = '';
   let criticalError = null;

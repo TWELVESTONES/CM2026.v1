@@ -308,60 +308,72 @@ async function addOneDriveRemote(safeName) {
     throw new Error(`Failed to start OneDrive setup for "${safeName}":\n${stderr || stdout}`);
   }
 
-  let steps = 0;
-  while (state && state.State) {
-    if (state.Error) {
+  // From here on, the `config create` call above has already written a stub
+  // config section for `safeName` to disk. Any failure below — a wizard-
+  // reported Error, an unanswerable question hitting MAX_STEPS, or the
+  // post-wizard drive_id/drive_type check failing — needs to roll that stub
+  // back, not just the final verification-failure case: a QA pass ahead of
+  // this release found that rclone's onedrive backend can report a
+  // ConfigError *partway* through the wizard (its own error for e.g. a
+  // failed Microsoft Graph call — "/me/drives", "/me/drive", or
+  // "/drives/<id>/root" failing, which can happen even after a completely
+  // valid sign-in, and is more common for work/school accounts) — and an
+  // earlier version of this function only cleaned up the "wizard said done
+  // but drive_id/drive_type is still missing" case below, leaving any other
+  // failure's half-created remote sitting in rclone.conf permanently. That
+  // orphaned entry would then just sit there getting silently excluded (and
+  // nagged about) by mount.js's filtering on every future launch forever,
+  // instead of ever actually going away.
+  try {
+    let steps = 0;
+    while (state && state.State) {
+      if (state.Error) {
+        throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
+      }
+      if (++steps > MAX_STEPS) {
+        throw new Error(
+          `OneDrive setup for "${safeName}" didn't finish after ${MAX_STEPS} steps ` +
+          `(stuck asking about "${(state.Option && state.Option.Name) || state.State}"). ` +
+          `This likely means rclone asked a question CloudMerge doesn't yet know how to ` +
+          `answer automatically — please let me know so I can add support for it.`
+        );
+      }
+      const answer = answerForWizardStep(state);
+      ({ stdout, stderr, code } = await run([
+        'config', 'update', safeName,
+        '--continue', '--state', state.State, '--result', answer,
+        '--non-interactive',
+      ]));
+      state = parseWizardJSON(stdout);
+    }
+    if (state && state.Error) {
       throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
     }
-    if (++steps > MAX_STEPS) {
+
+    // Belt-and-suspenders: the wizard reporting "done" (empty State) isn't
+    // by itself proof drive_id/drive_type actually got set — confirm it
+    // directly against the config rclone just wrote, so a still-broken
+    // remote is caught here with a clear, actionable error instead of
+    // resurfacing later as the exact confusing mount-time CRITICAL crash
+    // this fix exists to prevent. (mount.js's regenerateCombineRemote also
+    // still excludes any already-incomplete OneDrive remote from the
+    // combine upstreams as a second line of defense, in case one is already
+    // sitting in an existing install's config from before this existed.)
+    const dump = await dumpAllRemoteConfigs();
+    if (dump && !isRemoteConfigComplete(dump[safeName])) {
       throw new Error(
-        `OneDrive setup for "${safeName}" didn't finish after ${MAX_STEPS} steps ` +
-        `(stuck asking about "${(state.Option && state.Option.Name) || state.State}"). ` +
-        `This likely means rclone asked a question CloudMerge doesn't yet know how to ` +
-        `answer automatically — please let me know so I can add support for it.`
+        `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
+        `which drive to use, so it wasn't kept. Try adding it again — if this keeps ` +
+        `happening, let me know and send the exact wording.`
       );
     }
-    const answer = answerForWizardStep(state);
-    ({ stdout, stderr, code } = await run([
-      'config', 'update', safeName,
-      '--continue', '--state', state.State, '--result', answer,
-      '--non-interactive',
-    ]));
-    state = parseWizardJSON(stdout);
-  }
-  if (state && state.Error) {
-    throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
-  }
-
-  // Belt-and-suspenders: the wizard reporting "done" (empty State) isn't by
-  // itself proof drive_id/drive_type actually got set — confirm it directly
-  // against the config rclone just wrote, so a still-broken remote is
-  // caught here with a clear, actionable error instead of resurfacing later
-  // as the exact confusing mount-time CRITICAL crash this fix exists to
-  // prevent.
-  //
-  // If it's still incomplete, remove the stub `config create` already wrote
-  // rather than leaving it behind: an earlier version of this check threw a
-  // clear error here but left the half-created remote in place, which then
-  // silently kept crashing the *entire* combined mount (all providers, not
-  // just OneDrive) on every future launch — the exact confusing CRITICAL
-  // crash this whole fix exists to prevent, just deferred to the next
-  // restart instead of prevented outright. (mount.js's regenerateCombineRemote
-  // also now excludes any already-incomplete OneDrive remote from the
-  // combine upstreams as a second line of defense, in case one is already
-  // sitting in an existing install's config from before this existed.)
-  const dump = await dumpAllRemoteConfigs();
-  if (dump && !isRemoteConfigComplete(dump[safeName])) {
+  } catch (err) {
     try {
       await removeRemote(safeName);
     } catch (_) {
-      // best-effort cleanup — the error thrown below is the important part
+      // best-effort cleanup — the original error re-thrown below is what matters
     }
-    throw new Error(
-      `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
-      `which drive to use, so it wasn't kept. Try adding it again — if this keeps ` +
-      `happening, let me know and send the exact wording.`
-    );
+    throw err;
   }
 }
 

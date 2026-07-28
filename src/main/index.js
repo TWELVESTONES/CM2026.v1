@@ -222,20 +222,23 @@ ipcMain.handle('providers:list', async () => rclone.PROVIDER_MAP);
 
 ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
   const safeName = await rclone.addRemote(name, provider, params);
-  await mountMgr.regenerateCombineRemote();
   // Always remount (not just "mount if not already mounted"): rclone's
   // `combine` backend only reads its upstream list once, at mount start, so
   // a live mount doesn't pick up a newly-added account on its own — it has
   // to be torn down and re-established. This is also why previously only
   // the *first* connected account ever actually showed up in the folder.
   //
-  // Wrapped in try/catch (previously unguarded): a mount hiccup here is a
-  // separate, non-fatal problem from "was the account added" — the account
-  // above was already added successfully. Letting a mount failure throw out
-  // of this whole handler used to skip the friendly-name lookup below
-  // entirely and made the renderer wrongly report "Could not add account"
-  // for an account that, in fact, had been added.
+  // Wrapped in try/catch (previously unguarded, and previously
+  // regenerateCombineRemote() itself ran outside this try entirely): a
+  // hiccup anywhere in here — including regenerating the combine config, not
+  // just the remount that follows it — is a separate, non-fatal problem
+  // from "was the account added" — the account above was already added
+  // successfully. Letting a failure here throw out of this whole handler
+  // used to skip the friendly-name lookup below entirely and made the
+  // renderer wrongly report "Could not add account" for an account that, in
+  // fact, had been added.
   try {
+    await mountMgr.regenerateCombineRemote();
     if (await driverCheck.ensureDriverOrPrompt()) {
       await mountMgr.remount();
       warnAboutSkippedRemotes();
@@ -261,11 +264,12 @@ ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
 ipcMain.handle('accounts:remove', async (_evt, name) => {
   await rclone.removeRemote(name);
   accountLabels.removeLabel(name.replace(/:$/, ''));
-  await mountMgr.regenerateCombineRemote();
   // Same reasoning as accounts:add above: refresh the live mount so a
-  // removed account's folder actually disappears, and don't let a mount
-  // hiccup mask the fact that the account itself was removed successfully.
+  // removed account's folder actually disappears, and don't let a hiccup in
+  // regenerating the combine config or remounting mask the fact that the
+  // account itself was removed successfully.
   try {
+    await mountMgr.regenerateCombineRemote();
     if (mountMgr.isMounted()) await mountMgr.remount();
   } catch (e) {
     dialog.showErrorBox(

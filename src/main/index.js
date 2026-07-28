@@ -82,6 +82,47 @@ function refreshTray() {
   if (tray) tray.setContextMenu(buildTrayMenu());
 }
 
+let backfillInFlight = false;
+
+/**
+ * Look up friendly names for any connected account that doesn't have one
+ * yet, and refresh the mounted folder if any were newly found.
+ *
+ * A single failed lookup (offline at the moment, a rate-limited API call,
+ * a revoked scope) used to mean that account's folder was stuck showing
+ * its technical remote name until CloudMerge was restarted — the only
+ * other place this ran was once, at startup. Called again periodically
+ * below so a transient failure gets other chances to resolve on its own
+ * during a long-running session, not just at the next restart.
+ */
+async function runLabelBackfill() {
+  if (backfillInFlight) return; // don't overlap if a previous run is still in progress
+  backfillInFlight = true;
+  try {
+    const remotes = await rclone.listRemotes();
+    const names = remotes.map((r) => r.replace(/:$/, '')).filter((r) => r !== 'merged');
+    const existing = accountLabels.readAll();
+    if (!names.some((n) => !existing[n])) return; // everything already has a label
+
+    await accountIdentity.backfillLabels(rclone, accountLabels, names);
+    if (mountMgr.isMounted()) {
+      await mountMgr.regenerateCombineRemote();
+      await mountMgr.remount();
+    }
+  } catch (_) {
+    // Best-effort — next periodic attempt (or the next add/remove/restart)
+    // will just try again.
+  } finally {
+    backfillInFlight = false;
+  }
+}
+
+// Retry unlabeled accounts periodically while CloudMerge is running, not
+// just once at startup — a transient failure (offline, rate-limited,
+// briefly-revoked scope) would otherwise leave that account's folder
+// stuck on its technical name for the rest of the session.
+setInterval(() => { runLabelBackfill().catch(() => {}); }, 3 * 60 * 1000);
+
 app.on('ready', async () => {
   try {
     tray = new Tray(path.join(__dirname, 'assets', 'tray-icon.png'));
@@ -129,21 +170,7 @@ app.on('ready', async () => {
       // lookup didn't succeed the first time. Never awaited — must not
       // delay startup — and the renderer's periodic refresh will just
       // pick up the result whenever it lands.
-      //
-      // The mounted folder's subfolder names are also friendly-named now
-      // (previously only the in-app account list was), but mount() above
-      // already ran using whatever labels existed *before* this backfill —
-      // so once new labels land here, remount so those accounts' folders
-      // pick up the friendly name too, instead of only updating on the
-      // next manual add/remove or a full restart.
-      accountIdentity.backfillLabels(rclone, accountLabels, remotes.map((r) => r.replace(/:$/, '')))
-        .then(async () => {
-          if (mountMgr.isMounted()) {
-            await mountMgr.regenerateCombineRemote();
-            await mountMgr.remount();
-          }
-        })
-        .catch(() => {});
+      runLabelBackfill();
     } else {
       createWindow();
     }
@@ -228,6 +255,21 @@ ipcMain.handle('accounts:remove', async (_evt, name) => {
 ipcMain.handle('accounts:labels', async () => accountLabels.readAll());
 
 ipcMain.handle('mount:open', async () => {
+  // Check first rather than always trying: every account add/remove briefly
+  // tears down and re-creates MOUNT_DIR while remounting (see mount.js), and
+  // if the folder isn't mounted at all, opening it can surface Windows' own
+  // native "Windows cannot find ... Make sure you typed the name correctly"
+  // dialog — confusing on its own, since it looks like a typo rather than
+  // "the folder isn't connected right now."
+  if (!mountMgr.isMounted()) {
+    dialog.showErrorBox(
+      'Cloud folder isn\'t connected right now',
+      'This can happen briefly while an account is being added or removed — try again in ' +
+      'a few seconds. If it keeps happening, check Manage Accounts for a connection error, ' +
+      'or try restarting CloudMerge.'
+    );
+    return;
+  }
   const result = await shell.openPath(mountMgr.MOUNT_DIR);
   if (result) {
     dialog.showErrorBox('Could not open Cloud Folder', result);

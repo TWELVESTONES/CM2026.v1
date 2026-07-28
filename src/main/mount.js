@@ -183,21 +183,47 @@ async function mount() {
   mountProcess = spawn(bin, args, { windowsHide: true });
   mountProcess.on('exit', () => { mountProcess = null; });
 
+  let stderrBuf = '';
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => resolve({ mountDir: MOUNT_DIR }), 2500);
+    const timeout = setTimeout(() => {
+      // Belt-and-suspenders: don't just trust that 2.5s elapsed without a
+      // recognized fatal-error line meaning the mount is healthy — check
+      // reality. rclone logs a lot of different fatal conditions (a bad
+      // upstream config, a backend that failed to initialize, ...) and we
+      // can't enumerate every possible message; if the process has already
+      // exited by the time this fires, the mount failed regardless of
+      // whether its stderr matched anything we were watching for. Verified
+      // this exact gap directly: a bad-upstream failure logs "CRITICAL:
+      // Failed to create file system for ..." and exits within ~50ms, but
+      // previously this timeout still resolved as success 2.5s later.
+      if (!isMounted()) {
+        reject(new Error(
+          `rclone exited before the mount could be confirmed.\n\n${stderrBuf || '(no output captured)'}`
+        ));
+        return;
+      }
+      resolve({ mountDir: MOUNT_DIR });
+    }, 2500);
     mountProcess.stderr.on('data', (d) => {
       const s = d.toString();
-      // Only treat genuinely fatal, mount-never-started failures as a
-      // rejection. rclone logs plenty of "ERROR"-level lines for one-off,
-      // per-item problems (a single unreadable file, a symlink it skipped,
-      // a rate-limited API call) while the mount itself succeeds and stays
-      // up — matching on the bare word "error" (as this used to) treated
-      // those as if the whole mount had failed, which produced a false
-      // "could not connect the folder" report even though it had. rclone's
-      // own fatal-startup failures are consistently logged as "CRITICAL:
-      // Fatal error: ..." (verified against real failure output), so match
-      // that instead.
-      if (/fatal error|failed to mount fuse/i.test(s)) {
+      stderrBuf += s;
+      // rclone's own log levels distinguish routine per-item problems
+      // ("ERROR :" — a single unreadable file, a symlink it skipped, a
+      // rate-limited API call — the mount itself keeps running) from
+      // failures serious enough that the process gives up and exits
+      // ("CRITICAL:" — e.g. "Fatal error: failed to mount FUSE fs: ...",
+      // or "Failed to create file system for ..." when one account's
+      // upstream fails to initialize). Matching on the bare word "error"
+      // (as this used to) treated routine per-item ERROR lines as if the
+      // whole mount had failed, producing a false "could not connect the
+      // folder" report even when it hadn't; matching only two specific
+      // fatal phrases missed other CRITICAL failures entirely (the
+      // bad-upstream case above), silently reporting success on a mount
+      // that had already crashed. Matching rclone's own CRITICAL level
+      // catches genuine fatal failures immediately without needing to
+      // enumerate every possible message, and without misfiring on
+      // benign ERROR-level noise.
+      if (/critical:/i.test(s)) {
         clearTimeout(timeout);
         reject(new Error(s));
       }

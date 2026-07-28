@@ -247,7 +247,31 @@ ipcMain.handle('accounts:list', async () => rclone.listRemotes());
 ipcMain.handle('providers:list', async () => rclone.PROVIDER_MAP);
 
 ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
-  const safeName = await rclone.addRemote(name, provider, params);
+  // Wrapped in try/catch (previously unguarded): when this throws — e.g.
+  // addOneDriveRemote()'s own belt-and-suspenders check rolling back a
+  // sign-in that finished but never got a drive recorded — the ONLY place
+  // that error text was surfaced was the renderer's status banner, which
+  // gets overwritten within the same tick by the refreshAccountList() call
+  // in this same handler's (and addAccount()'s own) `finally` block, plus a
+  // 4-second polling timer on top of that. A user report ("it appeared to
+  // succeed, then a quick error too fast to capture, then the account
+  // disappeared") is exactly this: the real, useful error message WAS being
+  // shown, just for under a second. Since this app's only way to learn what
+  // actually went wrong with a real OneDrive sign-in is the person reading
+  // and reporting that exact text back, losing it here was losing the one
+  // diagnostic signal this bug still needed. A native dialog box blocks
+  // until dismissed, so there's no time limit on reading (or screenshotting)
+  // it — matching how every other user-facing error in this file is shown.
+  let safeName;
+  try {
+    safeName = await rclone.addRemote(name, provider, params);
+  } catch (e) {
+    dialog.showErrorBox(
+      `Could not add ${provider === 'onedrive' ? 'OneDrive' : provider} account`,
+      String(e && e.message || e)
+    );
+    throw e;
+  }
   // Always remount (not just "mount if not already mounted"): rclone's
   // `combine` backend only reads its upstream list once, at mount start, so
   // a live mount doesn't pick up a newly-added account on its own — it has

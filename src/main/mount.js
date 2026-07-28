@@ -376,7 +376,32 @@ async function remount() {
   return mount();
 }
 
+// mount()/unmount()/remount() are each called from several independent
+// places — startup, the accounts:add/accounts:remove IPC handlers, the
+// periodic label-backfill timer in index.js, and app quit — with nothing
+// previously stopping two of them from running at the same time (a QA pass
+// ahead of the v0.1.12 release flagged this as a real gap). Two overlapping
+// mount() calls can each see isMounted() === false and both spawn their own
+// rclone mount process onto the same MOUNT_DIR: only the second one ends up
+// tracked in `mountProcess`, so the first is orphaned — still running,
+// invisible to isMounted()/unmount(), and left behind in Task Manager even
+// after a clean "Quit CloudMerge" successfully kills the one process this
+// module still knows about. Serializing every call through this queue
+// means only one mount-affecting operation is ever in flight at a time,
+// however many callers ask for one concurrently.
+let opQueue = Promise.resolve();
+function serialized(fn) {
+  return (...args) => {
+    const result = opQueue.then(() => fn(...args), () => fn(...args));
+    opQueue = result.then(() => {}, () => {}); // keep the chain alive even if this call rejected
+    return result;
+  };
+}
+
 module.exports = {
-  mount, unmount, remount, isMounted, isMountFolderReady, MOUNT_DIR,
+  mount: serialized(mount),
+  unmount: serialized(unmount),
+  remount: serialized(remount),
+  isMounted, isMountFolderReady, MOUNT_DIR,
   regenerateCombineRemote, getSkippedRemotes,
 };

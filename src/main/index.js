@@ -212,7 +212,33 @@ app.on('ready', async () => {
 
 app.on('window-all-closed', (e) => e.preventDefault()); // stay in tray
 
-app.on('before-quit', async () => { await mountMgr.unmount(); });
+// A user report ("CloudMerge leaves processes running in Task Manager after
+// I Quit it") traced back to this handler: Electron's 'before-quit' listener
+// is synchronous (event: Event) => void — per Electron's own docs, calling
+// event.preventDefault() is the ONLY way to delay quitting; a returned
+// promise is simply ignored. The previous `async () => { await
+// mountMgr.unmount(); }` looked like it would wait for the rclone mount
+// process to be killed before the app exited, but Electron never actually
+// awaited it: it proceeded to tear down and exit the whole app immediately,
+// racing against (and usually winning against) unmount()'s kill() + up-to-
+// 5s wait — leaving the child rclone.exe mount process orphaned in Task
+// Manager every time "Quit CloudMerge" was used, not just occasionally.
+//
+// The fix is Electron's own documented pattern for async cleanup on quit:
+// prevent the default the FIRST time this fires, do the async cleanup, then
+// call app.quit() again ourselves once it's done — that second call re-fires
+// this same listener, so a flag lets it fall through and actually quit.
+let quitCleanupDone = false;
+app.on('before-quit', (e) => {
+  if (quitCleanupDone) return;
+  e.preventDefault();
+  mountMgr.unmount()
+    .catch(() => {}) // best-effort — a cleanup hiccup shouldn't block quitting outright
+    .finally(() => {
+      quitCleanupDone = true;
+      app.quit();
+    });
+});
 
 // ---- IPC bridge for the renderer (onboarding / account manager UI) ----
 

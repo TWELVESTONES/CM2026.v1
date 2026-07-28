@@ -98,21 +98,20 @@ async function listRemotes() {
 const PROVIDER_MAP = {
   google_drive: { type: 'drive', auth: 'oauth' },
   // onedrive needs one extra piece of setup beyond plain OAuth: after
-  // signing in, rclone's own interactive wizard normally asks which kind of
-  // drive to use (personal / business / SharePoint document library) and,
-  // for business/SharePoint accounts with more than one, which specific
-  // drive — a question CloudMerge has no way to answer (its `config create`
-  // call never provides stdin for that prompt), which previously left the
-  // account listed as "added" but with no `drive_id`/`drive_type` ever
-  // recorded, only surfacing as a mount-time crash: "CRITICAL: ... unable to
-  // get drive_id and drive_type" — confirmed against the real rclone binary,
-  // and confirmed that pre-supplying `config_type=onedrive` (the wizard's
-  // own option key for that first question) makes rclone skip the prompt
-  // and resolve it automatically instead of blocking on unavailable input.
-  // For personal Microsoft accounts (CloudMerge's stated "personal-scale"
-  // scope) there's normally exactly one drive, so this reaches a fully
-  // configured remote without needing a "which drive" answer at all.
-  onedrive: { type: 'onedrive', auth: 'oauth', extraConfig: { config_type: 'onedrive' } },
+  // signing in, rclone's own wizard always asks which specific drive to use
+  // (fetched live from Microsoft Graph's "/me/drives") — a question that,
+  // per rclone's own onedrive.go source, is NEVER skippable by pre-supplying
+  // a config key up front (there's no "if drive_id is already set, skip the
+  // lookup" shortcut). A first attempt at fixing this (v0.1.9/v0.1.10) only
+  // pre-supplied `config_type=onedrive`, which skips the earlier "type of
+  // connection" question but leaves this drive question completely
+  // unanswered — confirmed by a real-machine test to still reproduce the
+  // exact same "unable to get drive_id and drive_type" crash even on a
+  // fresh install. addRemote() below special-cases 'onedrive' to actually
+  // drive rclone's non-interactive config wizard end to end instead (see
+  // addOneDriveRemote), so this entry no longer carries an `extraConfig` —
+  // handling it generically here was the part that didn't work.
+  onedrive: { type: 'onedrive', auth: 'oauth' },
   dropbox: { type: 'dropbox', auth: 'oauth' },
   wd_cloud: {
     type: 'smb',
@@ -129,14 +128,17 @@ const PROVIDER_MAP = {
 /**
  * Create a new remote.
  *
- * For OAuth providers (google_drive/onedrive/dropbox), this drives rclone's
- * non-interactive config flow: `rclone config create <name> <type> ...`
- * opens the user's default browser for the OAuth consent screen and writes
- * the resulting token back into the config file once they finish signing in.
- * `extraConfig` (see PROVIDER_MAP, currently only set for onedrive) supplies
- * any additional wizard answers a backend needs beyond plain OAuth, so
- * rclone can resolve them itself instead of blocking on a prompt CloudMerge
- * has no way to answer.
+ * For most OAuth providers (google_drive/dropbox), this drives rclone's
+ * plain config flow: `rclone config create <name> <type> ...` opens the
+ * user's default browser for the OAuth consent screen and writes the
+ * resulting token back into the config file once they finish signing in —
+ * nothing else to answer, so a single call is enough.
+ *
+ * onedrive is handled separately by addOneDriveRemote() below: after OAuth
+ * it always has one more question rclone must resolve (which drive to use)
+ * that a single plain call can't answer, so it needs the fuller
+ * non-interactive wizard-driving treatment instead. See that function's
+ * comment for why.
  *
  * For manual providers (wd_cloud/SMB), `params` supplies the connection
  * details (host/share/user/pass) directly instead — no browser round trip,
@@ -153,10 +155,12 @@ async function addRemote(name, provider, params = {}) {
   if (!cfg) throw new Error(`Unknown provider: ${provider}`);
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-  const args = ['config', 'create', safeName, cfg.type, 'config_is_local', 'true'];
-  if (cfg.extraConfig) {
-    for (const [key, value] of Object.entries(cfg.extraConfig)) args.push(key, value);
+  if (provider === 'onedrive') {
+    await addOneDriveRemote(safeName);
+    return safeName;
   }
+
+  const args = ['config', 'create', safeName, cfg.type, 'config_is_local', 'true'];
   let hasSecret = false;
 
   if (cfg.auth === 'manual') {
@@ -178,6 +182,146 @@ async function addRemote(name, provider, params = {}) {
     throw new Error(`Failed to add ${provider} remote "${safeName}":\n${stderr || stdout}`);
   }
   return safeName;
+}
+
+/** Parse one line of rclone's `--non-interactive` JSON wizard output, or
+ * null if it isn't (yet) a parseable JSON question — e.g. still mid-OAuth,
+ * where rclone only logs plain NOTICE lines to stderr until the browser
+ * round trip finishes. */
+function parseWizardJSON(output) {
+  const trimmed = (output || '').trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Pick an answer for one step of rclone's non-interactive config wizard.
+ *
+ * - `config_type`: always "onedrive" (Personal/Business sign-in) — never
+ *   sharepoint/url/search/manual-ID, which need extra details CloudMerge's
+ *   UI has no field to collect.
+ * - Any yes/no confirmation (Type "bool", e.g. "use this drive?"): "true" —
+ *   there's nothing else CloudMerge could sensibly answer here.
+ * - Anything presented as a list of choices — most importantly the "which
+ *   drive" question itself, fetched live from Microsoft Graph — take the
+ *   first option. Personal Microsoft accounts (what CloudMerge targets)
+ *   normally have exactly one drive, so this is also the *only* one; for a
+ *   business/SharePoint account with several document libraries this would
+ *   pick arbitrarily, a known limitation given CloudMerge's UI has no
+ *   per-drive picker.
+ * - Otherwise, whatever default rclone itself proposes, or "" as a last resort.
+ */
+function answerForWizardStep(state) {
+  const opt = (state && state.Option) || {};
+  if (opt.Name === 'config_type') return 'onedrive';
+  if (opt.Type === 'bool') return 'true';
+  if (Array.isArray(opt.Examples) && opt.Examples.length > 0) {
+    return String(opt.Examples[0].Value);
+  }
+  if (opt.Default !== undefined && opt.Default !== null) return String(opt.Default);
+  return '';
+}
+
+/**
+ * Create a OneDrive remote by driving rclone's config wizard end to end via
+ * its documented `--non-interactive`/`--continue` protocol
+ * (https://rclone.org/commands/rclone_config_create/), instead of the
+ * single plain `config create` call used for google_drive/dropbox.
+ *
+ * Why OneDrive specifically needs this: after OAuth, the onedrive backend
+ * always has one more question — which specific drive to use, looked up
+ * live from Microsoft Graph's "/me/drives" — and per rclone's own
+ * onedrive.go source, that question is asked unconditionally; there is no
+ * "already have a drive_id, skip the lookup" shortcut. A plain `config
+ * create` call has no real terminal attached to answer it, so that prompt
+ * was previously never actually answered, leaving the remote listed as
+ * "added" but with no `drive_id`/`drive_type` ever recorded — invisible
+ * until the folder tried to mount. (An earlier fix in v0.1.10 only
+ * pre-supplied `config_type=onedrive`, which skips the *type of
+ * connection* question but not this one — confirmed insufficient by a
+ * real-machine test that reproduced the identical crash on a completely
+ * fresh install.)
+ *
+ * Each `--continue` call below returns the next question as JSON (or an
+ * empty State once done); answerForWizardStep() answers each one
+ * automatically, and the OAuth step itself (opening the browser, waiting
+ * for the person to actually sign in) happens synchronously inside
+ * whichever single call is running at the time — same as it always has.
+ *
+ * Verification note: the wizard protocol shape, JSON field names, and exact
+ * command syntax used here were confirmed directly against the real
+ * bundled rclone binary. The one step that can't be exercised in this
+ * sandbox (no real Microsoft account/network) is a live OAuth sign-in
+ * itself, so the drive-selection step immediately after it — while
+ * implemented from rclone's own source — hasn't been exercised against a
+ * real Microsoft Graph response.
+ */
+async function addOneDriveRemote(safeName) {
+  const MAX_STEPS = 25; // generous ceiling — a real run takes roughly 3-4 steps
+
+  let { stdout, stderr, code } = await run([
+    'config', 'create', safeName, 'onedrive',
+    'config_is_local', 'true',
+    '--non-interactive',
+  ]);
+  let state = parseWizardJSON(stdout);
+  if (!state && code !== 0) {
+    throw new Error(`Failed to start OneDrive setup for "${safeName}":\n${stderr || stdout}`);
+  }
+
+  let steps = 0;
+  while (state && state.State) {
+    if (state.Error) {
+      throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
+    }
+    if (++steps > MAX_STEPS) {
+      throw new Error(
+        `OneDrive setup for "${safeName}" didn't finish after ${MAX_STEPS} steps ` +
+        `(stuck asking about "${(state.Option && state.Option.Name) || state.State}"). ` +
+        `This likely means rclone asked a question CloudMerge doesn't yet know how to ` +
+        `answer automatically — please let me know so I can add support for it.`
+      );
+    }
+    const answer = answerForWizardStep(state);
+    ({ stdout, stderr, code } = await run([
+      'config', 'update', safeName,
+      '--continue', '--state', state.State, '--result', answer,
+      '--non-interactive',
+    ]));
+    state = parseWizardJSON(stdout);
+  }
+  if (state && state.Error) {
+    throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
+  }
+
+  // Belt-and-suspenders: the wizard reporting "done" (empty State) isn't by
+  // itself proof drive_id/drive_type actually got set — confirm it directly
+  // against the config rclone just wrote, so a still-broken remote is
+  // caught here with a clear, actionable error instead of resurfacing later
+  // as the exact confusing mount-time CRITICAL crash this fix exists to
+  // prevent.
+  const { stdout: dumpOut, code: dumpCode } = await run(['config', 'dump']);
+  if (dumpCode === 0) {
+    let parsedDump;
+    try {
+      parsedDump = JSON.parse(dumpOut);
+    } catch (_) {
+      parsedDump = null; // couldn't parse — don't block on a check we can't perform
+    }
+    if (parsedDump) {
+      const section = parsedDump[safeName];
+      if (!section || !section.drive_id || !section.drive_type) {
+        throw new Error(
+          `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
+          `which drive to use. Try removing it in Manage Accounts and adding it again.`
+        );
+      }
+    }
+  }
 }
 
 async function removeRemote(name) {

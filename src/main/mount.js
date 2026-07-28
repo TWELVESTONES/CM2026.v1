@@ -114,6 +114,36 @@ function isMounted() {
 }
 
 /**
+ * Whether the mounted folder is *actually usable* right now, not just
+ * whether the rclone process happens to still be running.
+ *
+ * `isMounted()` only reflects "the child process hasn't exited" — but a
+ * process can stay alive indefinitely without WinFsp ever having actually
+ * attached the mount (for example, if MOUNT_DIR already existed with
+ * leftover content from an older version/failed attempt, which blocks
+ * Windows's fixed-disk mount mode from ever creating the reparse point).
+ * That gap is exactly what let CloudMerge report "Connected" while
+ * Explorer's own "Windows cannot find ... CloudMerge" error still showed
+ * up when opening the folder — verified by reasoning through the reported
+ * screenshot: the app displayed its "Connected" state (so `mount()` had
+ * already resolved successfully) yet the OS-level path didn't exist.
+ *
+ * The one signal that's reliable on both Windows (target doesn't exist at
+ * all until WinFsp attaches it) and Linux/macOS (target is pre-created
+ * empty, then FUSE overlays it) is: once truly mounted, listing MOUNT_DIR
+ * returns at least one entry, because `mount()` never runs with zero
+ * configured remotes (see the `hasRemotes` guard below) — so a genuinely
+ * live mount always has at least one account subfolder to show.
+ */
+function isMountFolderReady() {
+  try {
+    return fs.readdirSync(MOUNT_DIR).length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Get MOUNT_DIR into the state rclone needs it in before mounting — and
  * that state is the *opposite* on Windows vs. Linux/macOS.
  *
@@ -130,6 +160,11 @@ function isMounted() {
  * mounted CloudMerge folder sitting on disk — every real mount attempt
  * failed silently against it, which is why accounts appeared "connected"
  * in the account list but the folder stayed empty.
+ *
+ * Returns `{ hadStaleNonEmptyDir }` so mount() can mention this specific,
+ * known cause by name if the mount below never actually comes up — a
+ * leftover non-empty folder at this exact path is a very plausible reason
+ * Windows's fixed-disk mode would silently refuse to attach.
  */
 function prepareMountDir() {
   if (process.platform === 'win32') {
@@ -139,12 +174,19 @@ function prepareMountDir() {
       // non-empty for any reason, leave it alone and let rclone's own
       // mount error surface rather than risk deleting real files.
       const isEmpty = fs.readdirSync(MOUNT_DIR).length === 0;
-      if (isEmpty) fs.rmdirSync(MOUNT_DIR);
+      if (isEmpty) {
+        fs.rmdirSync(MOUNT_DIR);
+      } else {
+        return { hadStaleNonEmptyDir: true };
+      }
     }
-    return;
+    return { hadStaleNonEmptyDir: false };
   }
   if (!fs.existsSync(MOUNT_DIR)) fs.mkdirSync(MOUNT_DIR, { recursive: true });
+  return { hadStaleNonEmptyDir: false };
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function mount() {
   if (isMounted()) return { alreadyMounted: true, mountDir: MOUNT_DIR };
@@ -152,7 +194,7 @@ async function mount() {
   const hasRemotes = await regenerateCombineRemote();
   if (!hasRemotes) return { noAccounts: true };
 
-  prepareMountDir();
+  const { hadStaleNonEmptyDir } = prepareMountDir();
 
   const bin = rclone.getRclonePath();
   const args = [
@@ -184,51 +226,64 @@ async function mount() {
   mountProcess.on('exit', () => { mountProcess = null; });
 
   let stderrBuf = '';
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      // Belt-and-suspenders: don't just trust that 2.5s elapsed without a
-      // recognized fatal-error line meaning the mount is healthy — check
-      // reality. rclone logs a lot of different fatal conditions (a bad
-      // upstream config, a backend that failed to initialize, ...) and we
-      // can't enumerate every possible message; if the process has already
-      // exited by the time this fires, the mount failed regardless of
-      // whether its stderr matched anything we were watching for. Verified
-      // this exact gap directly: a bad-upstream failure logs "CRITICAL:
-      // Failed to create file system for ..." and exits within ~50ms, but
-      // previously this timeout still resolved as success 2.5s later.
-      if (!isMounted()) {
-        reject(new Error(
-          `rclone exited before the mount could be confirmed.\n\n${stderrBuf || '(no output captured)'}`
-        ));
-        return;
-      }
-      resolve({ mountDir: MOUNT_DIR });
-    }, 2500);
-    mountProcess.stderr.on('data', (d) => {
-      const s = d.toString();
-      stderrBuf += s;
-      // rclone's own log levels distinguish routine per-item problems
-      // ("ERROR :" — a single unreadable file, a symlink it skipped, a
-      // rate-limited API call — the mount itself keeps running) from
-      // failures serious enough that the process gives up and exits
-      // ("CRITICAL:" — e.g. "Fatal error: failed to mount FUSE fs: ...",
-      // or "Failed to create file system for ..." when one account's
-      // upstream fails to initialize). Matching on the bare word "error"
-      // (as this used to) treated routine per-item ERROR lines as if the
-      // whole mount had failed, producing a false "could not connect the
-      // folder" report even when it hadn't; matching only two specific
-      // fatal phrases missed other CRITICAL failures entirely (the
-      // bad-upstream case above), silently reporting success on a mount
-      // that had already crashed. Matching rclone's own CRITICAL level
-      // catches genuine fatal failures immediately without needing to
-      // enumerate every possible message, and without misfiring on
-      // benign ERROR-level noise.
-      if (/critical:/i.test(s)) {
-        clearTimeout(timeout);
-        reject(new Error(s));
-      }
-    });
+  let criticalError = null;
+  mountProcess.stderr.on('data', (d) => {
+    const s = d.toString();
+    stderrBuf += s;
+    // rclone's own log levels distinguish routine per-item problems
+    // ("ERROR :" — a single unreadable file, a symlink it skipped, a
+    // rate-limited API call — the mount itself keeps running) from
+    // failures serious enough that the process gives up and exits
+    // ("CRITICAL:" — e.g. "Fatal error: failed to mount FUSE fs: ...", or
+    // "Failed to create file system for ..." when one account's upstream
+    // fails to initialize). Matching on the bare word "error" (as this
+    // used to) treated routine per-item ERROR lines as if the whole mount
+    // had failed; matching only two specific fatal phrases missed other
+    // CRITICAL failures entirely. Matching rclone's own CRITICAL level
+    // catches genuine fatal failures without needing to enumerate every
+    // possible message, and without misfiring on benign ERROR-level noise.
+    if (/critical:/i.test(s)) criticalError = s;
   });
+
+  // Don't just trust that some fixed amount of time passed without a
+  // recognized fatal-error line meaning the mount is healthy — poll for
+  // the mount actually becoming *usable* instead. A process staying alive
+  // is not the same thing as WinFsp having actually attached the folder:
+  // that gap is exactly what let a mount silently fail to attach (e.g.
+  // because MOUNT_DIR already existed non-empty, which blocks Windows's
+  // fixed-disk mount mode, without rclone logging anything CRITICAL) while
+  // CloudMerge still reported "Connected" — confirmed by a real report
+  // where the app showed "Connected" yet Explorer's own "Windows cannot
+  // find ... CloudMerge" error still appeared when opening the folder.
+  // `isMountFolderReady()` checks for real content in MOUNT_DIR, which is
+  // only ever true once the mount has genuinely attached (see its comment
+  // for why that signal is reliable on both Windows and Linux/macOS).
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (criticalError) throw new Error(criticalError);
+    if (!isMounted()) {
+      throw new Error(
+        `rclone exited before the mount could be confirmed.\n\n${stderrBuf || '(no output captured)'}`
+      );
+    }
+    if (isMountFolderReady()) return { mountDir: MOUNT_DIR };
+    await sleep(250);
+  }
+
+  // Timed out without ever seeing the mount become usable, and without a
+  // recognized fatal error either — something is either very slow, or
+  // WinFsp silently refused to attach without logging anything we'd
+  // recognize as fatal.
+  const staleDirHint = hadStaleNonEmptyDir
+    ? `\n\nThis looks like it may be caused by ${MOUNT_DIR} already existing with ` +
+      `leftover files in it (e.g. from an older CloudMerge version, or a previous ` +
+      `failed connection) — Windows won't connect the folder onto a path that ` +
+      `already exists and isn't empty. Try closing CloudMerge, renaming or moving ` +
+      `that folder aside, and reopening CloudMerge.`
+    : '';
+  throw new Error(
+    `CloudMerge folder didn't finish connecting.\n\n${stderrBuf || '(no output captured)'}${staleDirHint}`
+  );
 }
 
 async function unmount() {
@@ -262,4 +317,4 @@ async function remount() {
   return mount();
 }
 
-module.exports = { mount, unmount, remount, isMounted, MOUNT_DIR, regenerateCombineRemote };
+module.exports = { mount, unmount, remount, isMounted, isMountFolderReady, MOUNT_DIR, regenerateCombineRemote };

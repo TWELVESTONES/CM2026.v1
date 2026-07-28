@@ -261,7 +261,14 @@ ipcMain.handle('mount:open', async () => {
   // native "Windows cannot find ... Make sure you typed the name correctly"
   // dialog — confusing on its own, since it looks like a typo rather than
   // "the folder isn't connected right now."
-  if (!mountMgr.isMounted()) {
+  // Check both that the rclone process is alive AND that the folder is
+  // actually populated (isMountFolderReady()) rather than isMounted() alone
+  // — a process can stay running without the mount ever having genuinely
+  // attached (see mount.js's isMountFolderReady() comment), which is what
+  // previously let this handler call shell.openPath() on a path Windows
+  // itself couldn't find, surfacing its own confusing native error dialog
+  // instead of this clearer one.
+  if (!mountMgr.isMounted() || !mountMgr.isMountFolderReady()) {
     dialog.showErrorBox(
       'Cloud folder isn\'t connected right now',
       'This can happen briefly while an account is being added or removed — try again in ' +

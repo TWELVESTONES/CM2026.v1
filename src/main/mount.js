@@ -9,10 +9,12 @@
  * configured remote, keyed by its own name), then `rclone mount` that one
  * virtual remote to a single local folder, e.g. ~/CloudMerge.
  *
- * Result: ~/CloudMerge/gdrive-jamesfw/..., ~/CloudMerge/onedrive-work/...,
- * ~/CloudMerge/dropbox-personal/... — one folder, one subfolder per account,
- * exactly like odrive's placeholder-file approach but backed by rclone's
- * VFS layer (on-demand file fetch, not a full local copy).
+ * Result: ~/CloudMerge/Google Drive — jamesfw@gmail.com/...,
+ * ~/CloudMerge/OneDrive — jamesfw@outlook.com/..., etc. — one folder, one
+ * friendly-named subfolder per account (falls back to the raw rclone remote
+ * name until a friendly identity has been looked up), exactly like odrive's
+ * placeholder-file approach but backed by rclone's VFS layer (on-demand file
+ * fetch, not a full local copy).
  *
  * Requires WinFsp (Windows) or macFUSE (Mac) to be installed — rclone mount
  * shells out to whichever FUSE-compatible driver is present on the system.
@@ -23,11 +25,54 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const rclone = require('./rclone');
+const accountLabels = require('./account-labels');
 
 const MOUNT_DIR = path.join(os.homedir(), 'CloudMerge');
 const COMBINE_REMOTE_NAME = 'merged';
 
 let mountProcess = null;
+
+// Mirrors renderer.js's own providerLabel() — keep the two in sync. Used to
+// build the same "Google Drive — jamesfw@gmail.com" style name for the
+// *mounted folder's subdirectory*, not just the in-app account list.
+function providerLabel(remoteName) {
+  if (remoteName.startsWith('gdrive') || remoteName.startsWith('google_drive') || remoteName.includes('google')) return 'Google Drive';
+  if (remoteName.startsWith('onedrive')) return 'OneDrive';
+  if (remoteName.startsWith('dropbox')) return 'Dropbox';
+  if (remoteName.startsWith('wd_cloud')) return 'WD Cloud / NAS';
+  return 'Cloud account';
+}
+
+// Windows (and, to a lesser extent, macOS/Linux) forbid these characters in
+// file/directory names. A looked-up identity is normally just an email
+// address, which never contains them, but sanitize defensively rather than
+// let an unexpected provider response (or display name) break mounting
+// entirely — falling back to the raw remote name if nothing usable remains.
+function sanitizeDirName(name, fallback) {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').trim();
+  return cleaned || fallback;
+}
+
+/**
+ * Build the subdirectory name a given remote should appear as inside the
+ * merged mount. Previously this was always the raw rclone remote name (e.g.
+ * "google_drive-ms4up8n3") — the friendly-name lookup in account-identity.js
+ * only ever fed the *in-app account list*, never the actual mounted folder,
+ * so the folder itself kept showing technical names even once labels worked.
+ *
+ * `usedNames` guards against two accounts resolving to the identical display
+ * name (e.g. the same account connected twice) — combine's upstream "dir"
+ * keys must be unique, or one silently shadows the other.
+ */
+function friendlyDirName(remoteName, labels, usedNames) {
+  const label = labels[remoteName];
+  let dirName = label
+    ? sanitizeDirName(`${providerLabel(remoteName)} — ${label}`, remoteName)
+    : remoteName;
+  if (usedNames.has(dirName)) dirName = `${dirName} (${remoteName.slice(-6)})`;
+  usedNames.add(dirName);
+  return dirName;
+}
 
 async function regenerateCombineRemote() {
   const remotes = (await rclone.listRemotes())
@@ -40,9 +85,23 @@ async function regenerateCombineRemote() {
     return false;
   }
 
-  // Build `upstreams` as "name=name:" pairs, one per configured account.
+  // Build `upstreams` as "dir=name:" pairs, one per configured account. The
+  // "dir" half is a friendly display name when we have one (falls back to
+  // the raw remote name otherwise) — it's just the mount's subfolder label,
+  // the "name:" half after the "=" is still the real rclone remote
+  // reference, unchanged. Each entry is individually double-quoted per
+  // rclone's own `--combine-upstreams` syntax: the overall `upstreams` value
+  // is itself a space-separated list, so an unquoted friendly name
+  // containing spaces (e.g. "Google Drive — jamesfw@gmail.com") would be
+  // misparsed as several separate entries and break the *entire* combined
+  // mount, not just that one account — verified this failure mode directly
+  // ("no \"=\" in upstream definition") before adding the quoting.
+  const labels = accountLabels.readAll();
+  const usedNames = new Set();
   const args = ['config', 'create', COMBINE_REMOTE_NAME, 'combine', 'upstreams'];
-  const upstreamArg = remotes.map((r) => `${r}=${r}:`).join(' ');
+  const upstreamArg = remotes
+    .map((r) => `"${friendlyDirName(r, labels, usedNames)}=${r}:"`)
+    .join(' ');
   const { code, stderr } = await rclone.run([...args, upstreamArg]);
   if (code !== 0) {
     throw new Error(`Failed to regenerate combined view: ${stderr}`);
@@ -102,6 +161,12 @@ async function mount() {
     '--vfs-cache-mode', 'writes',
     '--dir-cache-time', '30s',
     '--no-modtime',
+    // Without this, rclone's VFS layer refuses to render any entry it sees
+    // as a symlink at all ("symlinks not supported without the --links
+    // flag"), which can surface for a single item from any provider — not
+    // something specific to one account. --vfs-links makes it represent
+    // that item as a plain ".rclonelink" file instead of erroring.
+    '--vfs-links',
   ];
   // NOTE: this used to also push `--network-mode` on Windows, on the
   // (incorrect) assumption it was needed to mount onto a folder. rclone's
@@ -122,7 +187,17 @@ async function mount() {
     const timeout = setTimeout(() => resolve({ mountDir: MOUNT_DIR }), 2500);
     mountProcess.stderr.on('data', (d) => {
       const s = d.toString();
-      if (/failed to mount|error/i.test(s)) {
+      // Only treat genuinely fatal, mount-never-started failures as a
+      // rejection. rclone logs plenty of "ERROR"-level lines for one-off,
+      // per-item problems (a single unreadable file, a symlink it skipped,
+      // a rate-limited API call) while the mount itself succeeds and stays
+      // up — matching on the bare word "error" (as this used to) treated
+      // those as if the whole mount had failed, which produced a false
+      // "could not connect the folder" report even though it had. rclone's
+      // own fatal-startup failures are consistently logged as "CRITICAL:
+      // Fatal error: ..." (verified against real failure output), so match
+      // that instead.
+      if (/fatal error|failed to mount fuse/i.test(s)) {
         clearTimeout(timeout);
         reject(new Error(s));
       }

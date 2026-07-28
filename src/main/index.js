@@ -129,7 +129,20 @@ app.on('ready', async () => {
       // lookup didn't succeed the first time. Never awaited — must not
       // delay startup — and the renderer's periodic refresh will just
       // pick up the result whenever it lands.
+      //
+      // The mounted folder's subfolder names are also friendly-named now
+      // (previously only the in-app account list was), but mount() above
+      // already ran using whatever labels existed *before* this backfill —
+      // so once new labels land here, remount so those accounts' folders
+      // pick up the friendly name too, instead of only updating on the
+      // next manual add/remove or a full restart.
       accountIdentity.backfillLabels(rclone, accountLabels, remotes.map((r) => r.replace(/:$/, '')))
+        .then(async () => {
+          if (mountMgr.isMounted()) {
+            await mountMgr.regenerateCombineRemote();
+            await mountMgr.remount();
+          }
+        })
         .catch(() => {});
     } else {
       createWindow();

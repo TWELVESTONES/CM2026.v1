@@ -46,9 +46,11 @@ async function ensureDriverOrPrompt() {
   const url = isWin ? 'https://winfsp.dev/rel/' : 'https://macfuse.github.io/';
 
   const detail = isWin
-    ? `CloudMerge's installer normally installs WinFsp for you automatically, so seeing ` +
-      `this dialog usually means that step didn't complete (a policy/antivirus block, or ` +
-      `an in-place upgrade from an older CloudMerge version that didn't bundle it). Click ` +
+    ? `CloudMerge's installer normally installs WinFsp for you automatically (you'll see a ` +
+      `Windows admin prompt for that step during setup, since installing a driver always ` +
+      `requires it) — so seeing this dialog usually means that step didn't complete: the ` +
+      `admin prompt was declined, a policy/antivirus block got in the way, or this is an ` +
+      `in-place upgrade from an older CloudMerge version that didn't bundle it. Click ` +
       `"Open download page" to install it manually, then relaunch CloudMerge.`
     : `macFUSE isn't bundled with CloudMerge — its license terms are stricter than WinFsp's ` +
       `and require separate written permission from its author before bundling (see ` +

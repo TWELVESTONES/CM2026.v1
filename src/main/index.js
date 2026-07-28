@@ -82,6 +82,29 @@ function refreshTray() {
   if (tray) tray.setContextMenu(buildTrayMenu());
 }
 
+/**
+ * Tell the user if regenerateCombineRemote() had to leave an account out of
+ * the combined folder because its own config was incomplete (currently only
+ * possible for a OneDrive account that never got a drive_id/drive_type
+ * recorded — see rclone.isRemoteConfigComplete). Without this, that account
+ * would just be silently missing from the folder with no explanation, which
+ * is exactly the kind of "invisible failure" this app keeps running into —
+ * the whole point of excluding it (rather than letting it crash the entire
+ * mount, as previously happened) is so this can be a small, specific, non-
+ * fatal warning instead of a total connection failure.
+ */
+function warnAboutSkippedRemotes() {
+  const skipped = mountMgr.getSkippedRemotes();
+  if (skipped.length === 0) return;
+  dialog.showErrorBox(
+    'One of your accounts needs attention',
+    `${skipped.join(', ')} couldn't be included in your Cloud Folder because its setup ` +
+    `never finished properly — this can happen with OneDrive accounts. Your other ` +
+    `accounts are working normally. To fix it, remove this account in Manage Accounts ` +
+    `and add it again.`
+  );
+}
+
 let backfillInFlight = false;
 
 /**
@@ -151,6 +174,7 @@ app.on('ready', async () => {
       if (await driverCheck.ensureDriverOrPrompt()) {
         try {
           await mountMgr.mount();
+          warnAboutSkippedRemotes();
         } catch (e) {
           // This used to be swallowed with a comment claiming the error was
           // "surfaced in UI on open" — nothing actually did that, so a mount
@@ -214,6 +238,7 @@ ipcMain.handle('accounts:add', async (_evt, { name, provider, params }) => {
   try {
     if (await driverCheck.ensureDriverOrPrompt()) {
       await mountMgr.remount();
+      warnAboutSkippedRemotes();
     }
   } catch (e) {
     dialog.showErrorBox(

@@ -32,6 +32,19 @@ const COMBINE_REMOTE_NAME = 'merged';
 
 let mountProcess = null;
 
+// Populated by regenerateCombineRemote() with any configured remote that got
+// left out of the combined mount because its own config is incomplete (see
+// rclone.isRemoteConfigComplete) — currently only possible for a OneDrive
+// account whose drive_id/drive_type never got recorded (e.g. one created
+// before addOneDriveRemote()'s own cleanup-on-failure existed). Exposed via
+// getSkippedRemotes() so index.js can tell the user *which* account needs
+// attention instead of the whole folder just silently missing it.
+let lastSkippedRemotes = [];
+
+function getSkippedRemotes() {
+  return lastSkippedRemotes;
+}
+
 // Mirrors renderer.js's own providerLabel() — keep the two in sync. Used to
 // build the same "Google Drive — jamesfw@gmail.com" style name for the
 // *mounted folder's subdirectory*, not just the in-app account list.
@@ -75,13 +88,34 @@ function friendlyDirName(remoteName, labels, usedNames) {
 }
 
 async function regenerateCombineRemote() {
-  const remotes = (await rclone.listRemotes())
+  const allRemotes = (await rclone.listRemotes())
     .map((r) => r.replace(/:$/, ''))
     .filter((r) => r !== COMBINE_REMOTE_NAME);
 
-  if (remotes.length === 0) {
+  if (allRemotes.length === 0) {
     // Nothing to combine yet — leave any previous combine config in place
     // rather than erroring, so the UI can still show an empty state.
+    lastSkippedRemotes = [];
+    return false;
+  }
+
+  // Exclude any remote whose own config is incomplete (currently: a OneDrive
+  // account missing drive_id/drive_type — see rclone.isRemoteConfigComplete)
+  // from the combine upstreams entirely, rather than including it and
+  // letting rclone's mount fail outright for *every* account. Previously a
+  // single broken OneDrive remote — even one left over from before
+  // addOneDriveRemote()'s own verification/cleanup existed — poisoned the
+  // whole merged mount with a CRITICAL crash, taking down Google Drive/
+  // Dropbox too, even though only one account was actually broken.
+  const dump = await rclone.dumpAllRemoteConfigs();
+  const remotes = dump
+    ? allRemotes.filter((r) => rclone.isRemoteConfigComplete(dump[r]))
+    : allRemotes; // couldn't check — don't block on a check we can't perform
+  lastSkippedRemotes = dump ? allRemotes.filter((r) => !remotes.includes(r)) : [];
+
+  if (remotes.length === 0) {
+    // Every configured remote is broken — nothing usable to combine, same
+    // as having no accounts at all.
     return false;
   }
 
@@ -317,4 +351,7 @@ async function remount() {
   return mount();
 }
 
-module.exports = { mount, unmount, remount, isMounted, isMountFolderReady, MOUNT_DIR, regenerateCombineRemote };
+module.exports = {
+  mount, unmount, remount, isMounted, isMountFolderReady, MOUNT_DIR,
+  regenerateCombineRemote, getSkippedRemotes,
+};

@@ -199,6 +199,41 @@ function parseWizardJSON(output) {
 }
 
 /**
+ * Every remote's raw config fields as reported by `rclone config dump`,
+ * keyed by remote name (no trailing colon) — the same data source used to
+ * verify a fresh OneDrive setup below, and reused by mount.js so a broken
+ * remote sitting in an existing config (from before this check existed, or
+ * from any other cause) gets excluded from the combined mount rather than
+ * crashing it outright. Returns null if the dump can't be read/parsed —
+ * callers should treat that as "couldn't check" and not block on it.
+ */
+async function dumpAllRemoteConfigs() {
+  const { stdout, code } = await run(['config', 'dump']);
+  if (code !== 0) return null;
+  try {
+    return JSON.parse(stdout);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Whether a remote's config section actually has everything its backend
+ * needs to work, beyond just existing. Currently this only matters for
+ * onedrive: `rclone config create` can report success and leave a config
+ * section behind (see addOneDriveRemote) without ever recording
+ * `drive_id`/`drive_type` — a gap that's otherwise silent until the combined
+ * folder tries to mount. Every other provider CloudMerge supports
+ * (google_drive/dropbox/wd_cloud) has no equivalent post-setup step, so an
+ * existing config section for those is assumed complete.
+ */
+function isRemoteConfigComplete(section) {
+  if (!section) return false;
+  if (section.type === 'onedrive') return Boolean(section.drive_id && section.drive_type);
+  return true;
+}
+
+/**
  * Pick an answer for one step of rclone's non-interactive config wizard.
  *
  * - `config_type`: always "onedrive" (Personal/Business sign-in) — never
@@ -304,23 +339,29 @@ async function addOneDriveRemote(safeName) {
   // caught here with a clear, actionable error instead of resurfacing later
   // as the exact confusing mount-time CRITICAL crash this fix exists to
   // prevent.
-  const { stdout: dumpOut, code: dumpCode } = await run(['config', 'dump']);
-  if (dumpCode === 0) {
-    let parsedDump;
+  //
+  // If it's still incomplete, remove the stub `config create` already wrote
+  // rather than leaving it behind: an earlier version of this check threw a
+  // clear error here but left the half-created remote in place, which then
+  // silently kept crashing the *entire* combined mount (all providers, not
+  // just OneDrive) on every future launch — the exact confusing CRITICAL
+  // crash this whole fix exists to prevent, just deferred to the next
+  // restart instead of prevented outright. (mount.js's regenerateCombineRemote
+  // also now excludes any already-incomplete OneDrive remote from the
+  // combine upstreams as a second line of defense, in case one is already
+  // sitting in an existing install's config from before this existed.)
+  const dump = await dumpAllRemoteConfigs();
+  if (dump && !isRemoteConfigComplete(dump[safeName])) {
     try {
-      parsedDump = JSON.parse(dumpOut);
+      await removeRemote(safeName);
     } catch (_) {
-      parsedDump = null; // couldn't parse — don't block on a check we can't perform
+      // best-effort cleanup — the error thrown below is the important part
     }
-    if (parsedDump) {
-      const section = parsedDump[safeName];
-      if (!section || !section.drive_id || !section.drive_type) {
-        throw new Error(
-          `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
-          `which drive to use. Try removing it in Manage Accounts and adding it again.`
-        );
-      }
-    }
+    throw new Error(
+      `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
+      `which drive to use, so it wasn't kept. Try adding it again — if this keeps ` +
+      `happening, let me know and send the exact wording.`
+    );
   }
 }
 
@@ -353,4 +394,6 @@ module.exports = {
   removeRemote,
   run,
   PROVIDER_MAP,
+  dumpAllRemoteConfigs,
+  isRemoteConfigComplete,
 };

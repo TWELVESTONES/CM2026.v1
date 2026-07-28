@@ -97,7 +97,22 @@ async function listRemotes() {
 // instead of a "click to sign in" button.
 const PROVIDER_MAP = {
   google_drive: { type: 'drive', auth: 'oauth' },
-  onedrive: { type: 'onedrive', auth: 'oauth' },
+  // onedrive needs one extra piece of setup beyond plain OAuth: after
+  // signing in, rclone's own interactive wizard normally asks which kind of
+  // drive to use (personal / business / SharePoint document library) and,
+  // for business/SharePoint accounts with more than one, which specific
+  // drive — a question CloudMerge has no way to answer (its `config create`
+  // call never provides stdin for that prompt), which previously left the
+  // account listed as "added" but with no `drive_id`/`drive_type` ever
+  // recorded, only surfacing as a mount-time crash: "CRITICAL: ... unable to
+  // get drive_id and drive_type" — confirmed against the real rclone binary,
+  // and confirmed that pre-supplying `config_type=onedrive` (the wizard's
+  // own option key for that first question) makes rclone skip the prompt
+  // and resolve it automatically instead of blocking on unavailable input.
+  // For personal Microsoft accounts (CloudMerge's stated "personal-scale"
+  // scope) there's normally exactly one drive, so this reaches a fully
+  // configured remote without needing a "which drive" answer at all.
+  onedrive: { type: 'onedrive', auth: 'oauth', extraConfig: { config_type: 'onedrive' } },
   dropbox: { type: 'dropbox', auth: 'oauth' },
   wd_cloud: {
     type: 'smb',
@@ -118,6 +133,10 @@ const PROVIDER_MAP = {
  * non-interactive config flow: `rclone config create <name> <type> ...`
  * opens the user's default browser for the OAuth consent screen and writes
  * the resulting token back into the config file once they finish signing in.
+ * `extraConfig` (see PROVIDER_MAP, currently only set for onedrive) supplies
+ * any additional wizard answers a backend needs beyond plain OAuth, so
+ * rclone can resolve them itself instead of blocking on a prompt CloudMerge
+ * has no way to answer.
  *
  * For manual providers (wd_cloud/SMB), `params` supplies the connection
  * details (host/share/user/pass) directly instead — no browser round trip,
@@ -135,6 +154,9 @@ async function addRemote(name, provider, params = {}) {
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
   const args = ['config', 'create', safeName, cfg.type, 'config_is_local', 'true'];
+  if (cfg.extraConfig) {
+    for (const [key, value] of Object.entries(cfg.extraConfig)) args.push(key, value);
+  }
   let hasSecret = false;
 
   if (cfg.auth === 'manual') {

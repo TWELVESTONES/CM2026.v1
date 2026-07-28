@@ -60,7 +60,7 @@ function getConfigPath() {
 }
 
 /** Run an rclone subcommand, resolving with {stdout, stderr, code}. */
-function run(args, opts = {}) {
+function run(args, opts = {}, _retriesLeft = 2) {
   return new Promise((resolve, reject) => {
     const bin = getRclonePath();
     if (!fs.existsSync(bin)) {
@@ -76,7 +76,26 @@ function run(args, opts = {}) {
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
-    child.on('error', reject);
+    child.on('error', (err) => {
+      // Diagnosed from a real report: CloudMerge's installer now auto-
+      // launches the app the instant setup finishes (runAfterFinish, see
+      // package.json), which can fire before Windows Defender's on-access
+      // scan of the just-written rclone.exe has released its lock on the
+      // file — the very first spawn attempt on a brand new install can fail
+      // with a generic, unhelpful "spawn UNKNOWN" even though the exe is
+      // completely fine. Retry a couple of times with a short delay before
+      // giving up, instead of surfacing a scary error on a fresh install.
+      // This only triggers on genuine spawn failures (the child process
+      // never started at all) — a normal rclone run that exits non-zero
+      // still resolves via 'close' below and is never retried here.
+      if (_retriesLeft > 0) {
+        setTimeout(() => {
+          run(args, opts, _retriesLeft - 1).then(resolve, reject);
+        }, 1500);
+      } else {
+        reject(err);
+      }
+    });
     child.on('close', (code) => resolve({ stdout, stderr, code }));
   });
 }

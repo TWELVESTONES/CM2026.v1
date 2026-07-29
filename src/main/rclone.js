@@ -297,31 +297,74 @@ function answerForWizardStep(state) {
 /**
  * Pick which drive to use from rclone's "config_driveid" choice list.
  *
- * Diagnosed from a real report: a user's OneDrive add attempt failed with
- * "Failed to query root for drive \"b!...\": HTTP error 400 ... ObjectHandle
- * is Invalid" — an error rclone's own onedrive backend raised while trying
- * to validate the drive CloudMerge had picked. That happened because the
- * old code just took Examples[0] unconditionally (see the comment this
- * replaced), and for this account, /me/drives listed more than one drive —
- * not just their own OneDrive, but at least one SharePoint document library
- * they have access to as well, and the document library happened to sort
- * first.
- *
+ * First diagnosed from a real report: a user's OneDrive add attempt failed
+ * with "Failed to query root for drive \"b!...\": HTTP error 400 ...
+ * ObjectHandle is Invalid" — an error rclone's own onedrive backend raised
+ * while trying to validate the drive CloudMerge had picked. The v0.1.16 fix
+ * below (the `isOwnType` check) addressed one cause of that: the old code
+ * took Examples[0] unconditionally, and this account's /me/drives response
+ * listed more than one drive — not just their own OneDrive, but at least
+ * one SharePoint document library too, which happened to sort first.
  * rclone's own onedrive.go labels each choice exactly "<name> (<type>)" in
- * its Help text, where <type> is "personal", "business", or
- * "documentLibrary" (confirmed against rclone's public source — CloudMerge
- * doesn't vendor or modify rclone itself, see NOTICE.md). A document
- * library is a shared SharePoint site's file store, never the signed-in
- * person's own OneDrive — exactly the kind of drive CloudMerge shouldn't be
- * guessing at, since its whole premise is unifying someone's *own* cloud
- * storage into one folder. Prefer a personal/business match; only fall back
- * to the first entry (old behavior) if nothing matches that pattern, so an
- * account that genuinely has just one drive (whatever type Graph reports it
- * as) still gets *something* picked rather than nothing.
+ * its Help text ("personal"/"business"/"documentLibrary", confirmed against
+ * rclone's public source — CloudMerge doesn't vendor or modify rclone
+ * itself, see NOTICE.md), so preferring a personal/business match over a
+ * document library was a real improvement.
+ *
+ * However, the SAME user hit the SAME exact "b!..." drive ID and the SAME
+ * ObjectHandle error again on a later attempt, on a build that already had
+ * the v0.1.16 fix — meaning that drive genuinely was labeled personal or
+ * business, and still failed. Researched afterward: this matches a
+ * documented Microsoft Graph limitation (reported independently on
+ * Microsoft's own Q&A forum and in rclone's issue tracker) where some
+ * drives are only queryable via a short alphanumeric drive ID (e.g.
+ * "540541d728bc6c6b"), while the longer "b!"-prefixed base64 composite ID
+ * format for that same class of drive — typical of SharePoint-backed
+ * drives, but also seen on some accounts' own OneDrive for Business drive —
+ * returns exactly this "ObjectHandle is Invalid" error when queried. So:
+ * within whichever drives are labeled personal/business, additionally
+ * prefer one with a short (non-"b!") ID when there's a choice. This never
+ * downgrades to a non-owned drive purely for ID format — it only breaks
+ * ties among the user's own drives — so it can't reintroduce the v0.1.16
+ * document-library bug.
+ *
+ * If an account's own drive is *only* ever offered in the "b!" format (no
+ * short-ID alternative), this can't fix that by itself — see
+ * addOneDriveRemote()'s error-path logging below, which now includes every
+ * drive choice offered so a future failure gives real evidence instead of
+ * another guess.
  */
 function chooseDriveId(examples) {
-  const own = examples.find((e) => /\((personal|business)\)/i.test(String(e.Help || '')));
-  return String((own || examples[0]).Value);
+  const isOwnType = (e) => /\((personal|business)\)/i.test(String(e.Help || ''));
+  const isShortId = (e) => !/^b!/i.test(String(e.Value || '').trim());
+
+  const ownTypeMatches = examples.filter(isOwnType);
+  const ownShort = ownTypeMatches.find(isShortId);
+  if (ownShort) return String(ownShort.Value);
+  if (ownTypeMatches.length > 0) return String(ownTypeMatches[0].Value);
+
+  const anyShort = examples.find(isShortId);
+  if (anyShort) return String(anyShort.Value);
+
+  return String(examples[0].Value);
+}
+
+/**
+ * Render the full list of drives rclone offered during config_driveid, for
+ * inclusion in an error message. Diagnosed from having burned multiple
+ * releases guessing at drive-selection fixes from a single reported drive
+ * ID with no visibility into what else was on offer — this makes the next
+ * failure (if any) self-diagnosing instead of another guess. Marks which
+ * one CloudMerge actually picked so it's clear whether the failure was a
+ * bad pick or the only-available option failing regardless.
+ */
+function formatDriveChoicesForError(choices, chosenValue) {
+  if (!choices || choices.length === 0) return '';
+  const lines = choices.map((e) => {
+    const marker = String(e.Value) === String(chosenValue) ? '-> ' : '   ';
+    return `${marker}${e.Help || '(no label)'} [id: ${e.Value}]`;
+  });
+  return `\n\nDrives offered for this account:\n${lines.join('\n')}`;
 }
 
 /**
@@ -360,6 +403,11 @@ function chooseDriveId(examples) {
  */
 async function addOneDriveRemote(safeName) {
   const MAX_STEPS = 25; // generous ceiling — a real run takes roughly 3-4 steps
+  // Captured when rclone presents the config_driveid step, purely for
+  // inclusion in an error message if setup fails afterward — see
+  // formatDriveChoicesForError()'s comment for why this exists.
+  let driveChoices = null;
+  let chosenDriveId = null;
 
   let { stdout, stderr, code } = await run([
     'config', 'create', safeName, 'onedrive',
@@ -390,8 +438,14 @@ async function addOneDriveRemote(safeName) {
   try {
     let steps = 0;
     while (state && state.State) {
+      if (state.Option && state.Option.Name === 'config_driveid' && Array.isArray(state.Option.Examples)) {
+        driveChoices = state.Option.Examples;
+      }
       if (state.Error) {
-        throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
+        throw new Error(
+          `OneDrive setup for "${safeName}" hit an error: ${state.Error}` +
+          formatDriveChoicesForError(driveChoices, chosenDriveId)
+        );
       }
       if (++steps > MAX_STEPS) {
         throw new Error(
@@ -402,6 +456,9 @@ async function addOneDriveRemote(safeName) {
         );
       }
       const answer = answerForWizardStep(state);
+      if (state.Option && state.Option.Name === 'config_driveid') {
+        chosenDriveId = answer;
+      }
       ({ stdout, stderr, code } = await run([
         'config', 'update', safeName,
         '--continue', '--state', state.State, '--result', answer,
@@ -410,7 +467,10 @@ async function addOneDriveRemote(safeName) {
       state = parseWizardJSON(stdout);
     }
     if (state && state.Error) {
-      throw new Error(`OneDrive setup for "${safeName}" hit an error: ${state.Error}`);
+      throw new Error(
+        `OneDrive setup for "${safeName}" hit an error: ${state.Error}` +
+        formatDriveChoicesForError(driveChoices, chosenDriveId)
+      );
     }
 
     // Belt-and-suspenders: the wizard reporting "done" (empty State) isn't
@@ -427,7 +487,8 @@ async function addOneDriveRemote(safeName) {
       throw new Error(
         `OneDrive account "${safeName}" finished sign-in, but rclone still didn't record ` +
         `which drive to use, so it wasn't kept. Try adding it again — if this keeps ` +
-        `happening, let me know and send the exact wording.`
+        `happening, let me know and send the exact wording.` +
+        formatDriveChoicesForError(driveChoices, chosenDriveId)
       );
     }
   } catch (err) {

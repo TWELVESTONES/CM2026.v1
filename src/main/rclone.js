@@ -272,26 +272,56 @@ function isRemoteConfigComplete(section) {
  * - `config_type`: always "onedrive" (Personal/Business sign-in) — never
  *   sharepoint/url/search/manual-ID, which need extra details CloudMerge's
  *   UI has no field to collect.
+ * - `config_driveid` (the "which drive" question, fetched live from
+ *   Microsoft Graph's /me/drives): prefer a personal or business OneDrive
+ *   over a SharePoint document library — see chooseDriveId() below for why.
  * - Any yes/no confirmation (Type "bool", e.g. "use this drive?"): "true" —
  *   there's nothing else CloudMerge could sensibly answer here.
- * - Anything presented as a list of choices — most importantly the "which
- *   drive" question itself, fetched live from Microsoft Graph — take the
- *   first option. Personal Microsoft accounts (what CloudMerge targets)
- *   normally have exactly one drive, so this is also the *only* one; for a
- *   business/SharePoint account with several document libraries this would
- *   pick arbitrarily, a known limitation given CloudMerge's UI has no
- *   per-drive picker.
+ * - Anything else presented as a list of choices: take the first option.
  * - Otherwise, whatever default rclone itself proposes, or "" as a last resort.
  */
 function answerForWizardStep(state) {
   const opt = (state && state.Option) || {};
   if (opt.Name === 'config_type') return 'onedrive';
+  if (opt.Name === 'config_driveid' && Array.isArray(opt.Examples) && opt.Examples.length > 0) {
+    return chooseDriveId(opt.Examples);
+  }
   if (opt.Type === 'bool') return 'true';
   if (Array.isArray(opt.Examples) && opt.Examples.length > 0) {
     return String(opt.Examples[0].Value);
   }
   if (opt.Default !== undefined && opt.Default !== null) return String(opt.Default);
   return '';
+}
+
+/**
+ * Pick which drive to use from rclone's "config_driveid" choice list.
+ *
+ * Diagnosed from a real report: a user's OneDrive add attempt failed with
+ * "Failed to query root for drive \"b!...\": HTTP error 400 ... ObjectHandle
+ * is Invalid" — an error rclone's own onedrive backend raised while trying
+ * to validate the drive CloudMerge had picked. That happened because the
+ * old code just took Examples[0] unconditionally (see the comment this
+ * replaced), and for this account, /me/drives listed more than one drive —
+ * not just their own OneDrive, but at least one SharePoint document library
+ * they have access to as well, and the document library happened to sort
+ * first.
+ *
+ * rclone's own onedrive.go labels each choice exactly "<name> (<type>)" in
+ * its Help text, where <type> is "personal", "business", or
+ * "documentLibrary" (confirmed against rclone's public source — CloudMerge
+ * doesn't vendor or modify rclone itself, see NOTICE.md). A document
+ * library is a shared SharePoint site's file store, never the signed-in
+ * person's own OneDrive — exactly the kind of drive CloudMerge shouldn't be
+ * guessing at, since its whole premise is unifying someone's *own* cloud
+ * storage into one folder. Prefer a personal/business match; only fall back
+ * to the first entry (old behavior) if nothing matches that pattern, so an
+ * account that genuinely has just one drive (whatever type Graph reports it
+ * as) still gets *something* picked rather than nothing.
+ */
+function chooseDriveId(examples) {
+  const own = examples.find((e) => /\((personal|business)\)/i.test(String(e.Help || '')));
+  return String((own || examples[0]).Value);
 }
 
 /**

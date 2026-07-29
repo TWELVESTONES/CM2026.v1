@@ -60,7 +60,7 @@ function getConfigPath() {
 }
 
 /** Run an rclone subcommand, resolving with {stdout, stderr, code}. */
-function run(args, opts = {}, _retriesLeft = 2) {
+function run(args, opts = {}, _retriesLeft = 8) {
   return new Promise((resolve, reject) => {
     const bin = getRclonePath();
     if (!fs.existsSync(bin)) {
@@ -83,15 +83,29 @@ function run(args, opts = {}, _retriesLeft = 2) {
       // scan of the just-written rclone.exe has released its lock on the
       // file — the very first spawn attempt on a brand new install can fail
       // with a generic, unhelpful "spawn UNKNOWN" even though the exe is
-      // completely fine. Retry a couple of times with a short delay before
-      // giving up, instead of surfacing a scary error on a fresh install.
-      // This only triggers on genuine spawn failures (the child process
-      // never started at all) — a normal rclone run that exits non-zero
-      // still resolves via 'close' below and is never retried here.
+      // completely fine. Retry with a short delay before giving up, instead
+      // of surfacing a scary error on a fresh install. This only triggers on
+      // genuine spawn failures (the child process never started at all) — a
+      // normal rclone run that exits non-zero still resolves via 'close'
+      // below and is never retried here.
+      //
+      // v0.1.14 shipped this with a ~3s total retry budget (2 retries x
+      // 1.5s), which turned out not to be enough — the same "spawn UNKNOWN"
+      // was reported again on a fresh v0.1.14 install. A first-time scan of
+      // a brand new, unsigned executable can involve a cloud reputation
+      // lookup (Defender's MAPS/Smart App Control checks), not just a local
+      // heuristic pass, which can run well past 3 seconds. Widened to 8
+      // retries at 2s apart (~16s total budget) to give that real-world
+      // range enough room. This only costs time on the rare first-launch
+      // race — every other call (and every later launch, once the file's
+      // already been scanned once) succeeds on the very first attempt with
+      // no delay at all. The tray icon is created before this ever runs
+      // (see index.js), so the app doesn't look frozen or unlaunched while
+      // this plays out in the background.
       if (_retriesLeft > 0) {
         setTimeout(() => {
           run(args, opts, _retriesLeft - 1).then(resolve, reject);
-        }, 1500);
+        }, 2000);
       } else {
         reject(err);
       }

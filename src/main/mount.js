@@ -317,7 +317,20 @@ async function mount() {
   // `isMountFolderReady()` checks for real content in MOUNT_DIR, which is
   // only ever true once the mount has genuinely attached (see its comment
   // for why that signal is reliable on both Windows and Linux/macOS).
-  const deadline = Date.now() + 15000;
+  // Diagnosed from a real report: the mount can still be genuinely on its
+  // way up past this deadline, not actually stuck — CloudMerge reported
+  // "didn't finish connecting" here, yet the status banner underneath that
+  // same error dialog already read "Connected" moments later, meaning
+  // isMountFolderReady() went on to succeed right after this loop gave up.
+  // 15s was tight for a first mount attempt in particular: WinFsp attaching
+  // the folder can be slow on the very first use after install/reboot for
+  // the same reasons a freshly-installed rclone.exe can be slow to launch
+  // (see rclone.js's run() retry) — antivirus scanning a binary/driver it
+  // hasn't seen before. Widened to give a slow-but-healthy first mount more
+  // room; a genuinely broken mount (WinFsp missing, a real rclone error)
+  // still surfaces via criticalError or isMounted() well before this, so
+  // this only delays the rare false-alarm case, not real failures.
+  const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     if (criticalError) throw new Error(criticalError);
     if (!isMounted()) {

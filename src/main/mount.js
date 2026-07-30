@@ -241,6 +241,13 @@ async function mount() {
 
   const { hadStaleNonEmptyDir } = prepareMountDir();
 
+  // How many upstream accounts this mount has to combine — used below to
+  // scale the readiness deadline. Cheap: listRemotes() is a plain
+  // `rclone listremotes` call, no network round trip of its own.
+  const remoteCount = (await rclone.listRemotes())
+    .map((r) => r.replace(/:$/, ''))
+    .filter((r) => r !== COMBINE_REMOTE_NAME).length;
+
   const bin = rclone.getRclonePath();
   const args = [
     '--config', rclone.getConfigPath(),
@@ -326,11 +333,30 @@ async function mount() {
   // the folder can be slow on the very first use after install/reboot for
   // the same reasons a freshly-installed rclone.exe can be slow to launch
   // (see rclone.js's run() retry) — antivirus scanning a binary/driver it
-  // hasn't seen before. Widened to give a slow-but-healthy first mount more
-  // room; a genuinely broken mount (WinFsp missing, a real rclone error)
-  // still surfaces via criticalError or isMounted() well before this, so
-  // this only delays the rare false-alarm case, not real failures.
-  const deadline = Date.now() + 30000;
+  // hasn't seen before. Widened to 30s to give a slow-but-healthy first
+  // mount more room.
+  //
+  // That 30s base turned out not to be enough on its own either: a later
+  // report hit the exact same "didn't finish connecting" failure again,
+  // this time with only benign NOTICE-level log lines (no CRITICAL error)
+  // right up to the deadline — the combine backend's own "Symlinks support
+  // enabled" startup line only appeared ~29s in, i.e. the mount was still
+  // in the middle of starting up when the poll gave up. The account list at
+  // the time had seven upstreams combined (five Google Drive accounts, a
+  // Dropbox, and a OneDrive) — each upstream backend does its own
+  // initialization (token refresh/validation, etc.) serially before the
+  // combine mount can finish attaching, so more accounts genuinely means
+  // more startup time, independent of the first-mount AV/driver-scan delay
+  // above. Both effects can stack (a first mount with many accounts is the
+  // slowest case of all), so the deadline now scales with how many accounts
+  // are actually being combined instead of using one flat number for every
+  // account list size. Capped so a truly broken mount doesn't hang the UI
+  // for an unbounded time — a genuinely broken mount (WinFsp missing, a
+  // real rclone error) still surfaces via criticalError or isMounted() well
+  // before any of this, so the cap only matters for the false-alarm case.
+  const perExtraAccountMs = 4000;
+  const scaledBudgetMs = 30000 + Math.max(0, remoteCount - 1) * perExtraAccountMs;
+  const deadline = Date.now() + Math.min(scaledBudgetMs, 90000);
   while (Date.now() < deadline) {
     if (criticalError) throw new Error(criticalError);
     if (!isMounted()) {
